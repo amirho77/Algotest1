@@ -1,581 +1,2200 @@
+from __future__ import annotations
+
 from datetime import datetime, timedelta
 import io
 import re
+from typing import Iterable
+
 import numpy as np
-import openpyxl
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ==============================================================================
-# ۱. تنظیمات صفحه و تم گرافیکی
-# ==============================================================================
-st.set_page_config(
-    page_title="CGM Hypo Predictor MVP",
-    page_icon="🩸",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# ============================================================
+# CGM LOW-GLUCOSE EARLY-WARNING MVP v0.4
+# ============================================================
+# Purpose:
+#   Rule-based / mathematical early warning using CGM only.
+#   No ML, insulin, meals, activity, age, diabetes type, etc.
+#
+# Low definition:
+#   glucose <= 70 mg/dL
+#
+# Primary product horizon:
+#   30 minutes
+#
+# Important:
+#   This is a research/prototype algorithm, not a clinical device
+#   or a medical diagnosis/treatment system.
+#
+# Development tuning performed on the uploaded 14-day CGM dataset
+#   (4,021 readings, 5-minute sampling, 25 low episodes).
+# Parameters are intentionally explicit and inspectable.
+# ============================================================
 
-# استایل‌های CSS سفارشی (RTL و فونت یکپارچه)
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;700;900&display=swap');
-    
-    * {
-        font-family: 'Vazirmatn', Tahoma, sans-serif !important;
-    }
-    
-    .main {
-        direction: rtl;
-    }
-    
-    .metric-card {
-        background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 12px;
-        padding: 16px;
-        text-align: center;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-    }
-    
-    .status-badge-safe {
-        background-color: #d1fae5;
-        color: #065f46;
-        padding: 6px 12px;
-        border-radius: 20px;
-        font-weight: 700;
-        display: inline-block;
-    }
-    
-    .status-badge-warn {
-        background-color: #fee2e2;
-        color: #991b1b;
-        padding: 6px 12px;
-        border-radius: 20px;
-        font-weight: 700;
-        display: inline-block;
-        animation: pulse 2s infinite;
-    }
-    
-    .status-badge-low {
-        background-color: #7f1d1d;
-        color: #ffffff;
-        padding: 6px 12px;
-        border-radius: 20px;
-        font-weight: 700;
-        display: inline-block;
-    }
-    
-    .status-badge-buff {
-        background-color: #fef3c7;
-        color: #92400e;
-        padding: 6px 12px;
-        border-radius: 20px;
-        font-weight: 700;
-        display: inline-block;
-    }
-    
-    @keyframes pulse {
-        0% { transform: scale(1); }
-        50% { transform: scale(1.03); }
-        100% { transform: scale(1); }
-    }
-    </style>
-""",
-    unsafe_allow_html=True,
-)
-
-# ==============================================================================
-# ۲. هسته محاسباتی الگوریتم (Core Engine)
-# ==============================================================================
 CFG = {
-    "hypo_threshold": 70.0,
-    "alert_margin": 5.0,  # حاشیه پیش‌بینی (70 + 5 = 75 mg/dL)
-    "risk_score_threshold": 75.0,  # آستانه ریسک
-    "tau_minutes": 45.0,  # پارامتر میرایی افق زمانی
-    "horizons": [30, 45, 60],
-    "w_dist": 0.35,
-    "w_vel": 0.35,
-    "w_acc": 0.15,
-    "w_persist": 0.15,
+    "LOW": 70.0,
+
+    # History / sampling assumptions
+    "LOOKBACK_MIN": 60,
+    "EXPECTED_SAMPLE_MIN": 5,
+    "MAX_ALLOWED_GAP_MIN": 10,
+    "EMA_SPAN": 3,
+
+    # Forecast / risk score parameters
+    "RISK_THRESHOLD": 68.0,
+    "FORECAST_THRESHOLD": 80.0,
+    "TIME_RISK_HORIZON_MIN": 45.0,
+    "TIME_RISK_TARGET": 75.0,
+
+    # Risk components
+    # proximity + time-to-75 + velocity + long trend + persistence + acceleration
+    "W_PROX": 0.25,
+    "W_TIME": 0.45,
+    "W_VEL": 0.10,
+    "W_LONG_VEL": 0.05,
+    "W_PERSIST": 0.05,
+    "W_ACCEL": 0.10,
+
+    # Guard against short, noisy reversals / high-glucose transient drops
+    "MIN_ROC_30": -0.20,
+
+    # User-facing alert refractory period
+    "ALERT_COOLDOWN_MIN": 20,
+
+    "HORIZONS": [30, 45, 60],
 }
 
 
-def calculate_metrics_for_stream(records):
-    """محاسبه ویژگی‌های ریاضی و پیش‌بینی‌ها روی بافر زنده"""
-    if not records:
-        return []
+st.set_page_config(
+    page_title="CGM Low-Glucose Early Warning MVP v0.4",
+    page_icon="🩸",
+    layout="wide",
+)
 
-    df = pd.DataFrame(records)
-    df["Smooth"] = df["Raw"].ewm(span=3, adjust=False).mean()
+st.markdown(
+    """
+    <style>
+    .main { direction: rtl; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-    processed = []
-    for i in range(len(df)):
-        item = records[i].copy()
-        item["Smooth"] = round(float(df.loc[i, "Smooth"]), 1)
 
-        # در ۱۱ گام اول (کمتر از ۱ ساعت)، سیستم در حالت بافر است
-        if i < 11:
-            item["ROC_15m"] = "-"
-            item["Risk_Score"] = "-"
-            item["Pred_30m"] = "-"
-            item["Alert_30m"] = False
-            item["Pred_45m"] = "-"
-            item["Alert_45m"] = False
-            item["Pred_60m"] = "-"
-            item["Alert_60m"] = False
-            item["Status"] = f"بافر ({i+1}/12)"
-            processed.append(item)
+# ============================================================
+# INPUT / PARSING
+# ============================================================
+
+def parse_glucose(value) -> float:
+    s = str(value).strip().upper()
+
+    if s == "LOW":
+        return 39.0
+
+    if s == "HIGH":
+        return 401.0
+
+    return float(value)
+
+
+def parse_timestamp(value) -> pd.Timestamp:
+    s = re.sub(
+        r"\s*GMT.*$",
+        "",
+        str(value).strip(),
+    )
+
+    return pd.to_datetime(
+        s,
+        dayfirst=True,
+        errors="coerce",
+    )
+
+
+def normalize_dataframe(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if df.shape[1] < 2:
+        raise ValueError(
+            "فایل باید حداقل دو ستون داشته باشد: زمان و قند"
+        )
+
+    out = pd.DataFrame(
+        {
+            "Timestamp": df.iloc[:, 0].map(
+                parse_timestamp
+            ),
+            "Glucose": df.iloc[:, 1].map(
+                parse_glucose
+            ),
+        }
+    )
+
+    out = (
+        out
+        .dropna()
+        .sort_values("Timestamp")
+        .drop_duplicates(
+            "Timestamp",
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
+
+    if out.empty:
+        raise ValueError(
+            "هیچ رکورد معتبر زمان/قند پیدا نشد"
+        )
+
+    return out
+
+
+def read_sensor_file(
+    uploaded_file,
+) -> pd.DataFrame:
+
+    name = uploaded_file.name.lower()
+
+    if name.endswith(".csv"):
+        raw = pd.read_csv(
+            uploaded_file
+        )
+
+    else:
+        raw = pd.read_excel(
+            uploaded_file
+        )
+
+    return normalize_dataframe(
+        raw
+    )
+
+
+def split_segments(
+    df: pd.DataFrame,
+) -> list[pd.DataFrame]:
+
+    """
+    Split on large timestamp gaps so history/labels
+    never jump across missing data.
+    """
+
+    out = (
+        df
+        .sort_values("Timestamp")
+        .reset_index(drop=True)
+        .copy()
+    )
+
+    gaps = (
+        out["Timestamp"]
+        .diff()
+        .dt.total_seconds()
+        .div(60)
+    )
+
+    segment_id = (
+        gaps
+        .gt(CFG["MAX_ALLOWED_GAP_MIN"])
+        .cumsum()
+    )
+
+    out["Segment"] = (
+        segment_id.astype(int)
+    )
+
+    segments = []
+
+    for _, part in out.groupby(
+        "Segment",
+        sort=True,
+    ):
+        segments.append(
+            part
+            .drop(columns=["Segment"])
+            .reset_index(drop=True)
+        )
+
+    return segments
+
+
+def sample_df(
+    values: Iterable[float],
+    start: str = "2025-01-01 00:00",
+) -> pd.DataFrame:
+
+    values = [
+        float(v)
+        for v in values
+    ]
+
+    return pd.DataFrame(
+        {
+            "Timestamp": pd.date_range(
+                start=start,
+                periods=len(values),
+                freq="5min",
+            ),
+            "Glucose": values,
+        }
+    )
+
+
+# ============================================================
+# CORE FEATURE ENGINE
+# ============================================================
+
+def calculate_features(
+    segment: pd.DataFrame,
+) -> pd.DataFrame:
+
+    out = (
+        segment
+        .copy()
+        .reset_index(drop=True)
+    )
+
+    g = out["Glucose"].astype(
+        float
+    )
+
+    smooth = (
+        g
+        .ewm(
+            span=CFG["EMA_SPAN"],
+            adjust=False,
+        )
+        .mean()
+    )
+
+    out["Smooth"] = smooth
+
+    # --------------------------------------------------------
+    # Trend features
+    # --------------------------------------------------------
+
+    out["ROC_10m"] = (
+        smooth
+        - smooth.shift(2)
+    ) / 10.0
+
+    out["ROC_30m"] = (
+        smooth
+        - smooth.shift(6)
+    ) / 30.0
+
+    out["ROC_60m"] = (
+        smooth
+        - smooth.shift(12)
+    ) / 60.0
+
+    out["Raw_Net_10m"] = (
+        g
+        - g.shift(2)
+    )
+
+    # Recent slope minus long slope
+    # More negative = stronger downward acceleration.
+    out["Acceleration"] = (
+        out["ROC_10m"]
+        - out["ROC_30m"]
+    )
+
+    moves = g.diff()
+
+    out["Persistence_30m"] = (
+        moves
+        .lt(0)
+        .rolling(
+            6,
+            min_periods=6,
+        )
+        .mean()
+        * 100.0
+    )
+
+    out["Persistence_60m"] = (
+        moves
+        .lt(0)
+        .rolling(
+            12,
+            min_periods=12,
+        )
+        .mean()
+        * 100.0
+    )
+
+    # --------------------------------------------------------
+    # Adaptive trend slope
+    # --------------------------------------------------------
+    #
+    # Near Low:
+    #   recent 10m trend gets more weight.
+    #
+    # At high glucose:
+    #   30m trend gets more weight.
+    #
+    # This reduces sensitivity to a short high-glucose
+    # drop that quickly reverses.
+    # --------------------------------------------------------
+
+    trend = np.full(
+        len(out),
+        np.nan,
+        dtype=float,
+    )
+
+    for i in range(
+        len(out)
+    ):
+
+        g_now = g.iloc[i]
+
+        s10 = (
+            out["ROC_10m"].iloc[i]
+        )
+
+        s30 = (
+            out["ROC_30m"].iloc[i]
+        )
+
+        if not (
+            np.isfinite(s10)
+            and np.isfinite(s30)
+        ):
             continue
 
-        current_smooth = df.loc[i, "Smooth"]
-        current_raw = df.loc[i, "Raw"]
+        if g_now <= 90:
+            w10 = 0.70
 
-        # ROC در ۱۵ دقیقه (۳ گام قبلی)
-        roc_15m = (current_smooth - df.loc[i - 3, "Smooth"]) / 15.0
-        item["ROC_15m"] = round(float(roc_15m), 2)
+        elif g_now <= 110:
+            w10 = 0.55
 
-        # شتاب تغییرات
-        if i >= 5:
-            roc_prev = (df.loc[i - 2, "Smooth"] - df.loc[i - 5, "Smooth"]) / 15.0
-            acc = (roc_15m - roc_prev) / 10.0
+        elif g_now <= 140:
+            w10 = 0.35
+
         else:
-            acc = 0.0
+            w10 = 0.20
 
-        # تداوم نزول در ۱۲ خوانش اخیر
-        smooth_slice = df.loc[max(0, i - 11) : i, "Smooth"]
-        persistence = float((smooth_slice.diff() < 0).mean() * 100.0)
-
-        # نمره ریسک
-        s_dist = np.clip((180.0 - current_smooth) / 110.0 * 100.0, 0.0, 100.0)
-        s_vel = np.clip(-roc_15m / 2.0 * 100.0, 0.0, 100.0)
-        s_acc = np.clip(-acc / 0.1 * 100.0, 0.0, 100.0)
-        risk_score = (
-            CFG["w_dist"] * s_dist
-            + CFG["w_vel"] * s_vel
-            + CFG["w_acc"] * s_acc
-            + CFG["w_persist"] * persistence
+        trend[i] = (
+            w10 * s10
+            +
+            (1.0 - w10) * s30
         )
-        item["Risk_Score"] = round(float(risk_score), 1)
 
-        # محاسبه پیش‌بینی‌ها
-        has_alert = False
-        for h in CFG["horizons"]:
-            tau = CFG["tau_minutes"]
-            h_eff = tau * (1.0 - np.exp(-h / tau)) if tau else float(h)
-            pred_g = float(
-                np.clip(current_smooth + roc_15m * h_eff, 20.0, 400.0)
+    out["Trend_Slope"] = trend
+
+    # --------------------------------------------------------
+    # Exact-horizon forecasts
+    # --------------------------------------------------------
+
+    for h in CFG["HORIZONS"]:
+
+        out[f"Pred_{h}m"] = np.clip(
+            smooth
+            +
+            trend * h,
+            20.0,
+            400.0,
+        )
+
+    # --------------------------------------------------------
+    # Effective slope for Time-to-75
+    # --------------------------------------------------------
+
+    effective_slope = (
+        0.60 * out["ROC_10m"]
+        +
+        0.40 * out["ROC_30m"]
+    )
+
+    out["Effective_Slope"] = (
+        effective_slope
+    )
+
+    out["Time_to_75m"] = np.where(
+        effective_slope < 0,
+
+        (
+            CFG["TIME_RISK_TARGET"]
+            - smooth
+        )
+        / effective_slope,
+
+        np.inf,
+    )
+
+    # --------------------------------------------------------
+    # Risk components
+    # --------------------------------------------------------
+
+    # 1) Proximity
+    s_prox = np.clip(
+        (
+            130.0
+            - smooth
+        )
+        / 60.0
+        * 100.0,
+
+        0.0,
+        100.0,
+    )
+
+    # 2) Time-to-75
+    s_time = np.clip(
+        (
+            CFG["TIME_RISK_HORIZON_MIN"]
+            - out["Time_to_75m"]
+        )
+        / CFG["TIME_RISK_HORIZON_MIN"]
+        * 100.0,
+
+        0.0,
+        100.0,
+    )
+
+    s_time = np.where(
+        out["Time_to_75m"] <= 0,
+        100.0,
+        s_time,
+    )
+
+    # 3) Recent velocity
+    s_vel = np.clip(
+        -out["ROC_10m"]
+        / 1.5
+        * 100.0,
+
+        0.0,
+        100.0,
+    )
+
+    # 4) Long-term velocity
+    s_long_vel = np.clip(
+        -out["ROC_30m"]
+        / 1.0
+        * 100.0,
+
+        0.0,
+        100.0,
+    )
+
+    # 5) Persistence
+    s_persist = (
+        out["Persistence_60m"]
+        .fillna(0.0)
+    )
+
+    # 6) Acceleration
+    s_acc = np.clip(
+        -out["Acceleration"]
+        / 0.5
+        * 100.0,
+
+        0.0,
+        100.0,
+    )
+
+    # --------------------------------------------------------
+    # Final Risk Score
+    # --------------------------------------------------------
+
+    out["Risk_Score"] = (
+
+        CFG["W_PROX"]
+        * s_prox
+
+        +
+
+        CFG["W_TIME"]
+        * s_time
+
+        +
+
+        CFG["W_VEL"]
+        * s_vel
+
+        +
+
+        CFG["W_LONG_VEL"]
+        * s_long_vel
+
+        +
+
+        CFG["W_PERSIST"]
+        * s_persist
+
+        +
+
+        CFG["W_ACCEL"]
+        * s_acc
+    )
+
+    # Keep components for debugging.
+    out["Risk_Proximity"] = s_prox
+    out["Risk_Time"] = s_time
+    out["Risk_Velocity"] = s_vel
+    out["Risk_Long_Velocity"] = s_long_vel
+    out["Risk_Persistence"] = s_persist
+    out["Risk_Acceleration"] = s_acc
+
+    return out
+
+
+# ============================================================
+# FUTURE LABELS
+# ============================================================
+
+def add_future_labels(
+    segment: pd.DataFrame,
+) -> pd.DataFrame:
+
+    out = (
+        segment
+        .copy()
+        .reset_index(drop=True)
+    )
+
+    times = out[
+        "Timestamp"
+    ].to_numpy(
+        dtype="datetime64[ns]"
+    )
+
+    glucose = out[
+        "Glucose"
+    ].to_numpy(
+        dtype=float
+    )
+
+    for h in CFG["HORIZONS"]:
+
+        min_future = np.full(
+            len(out),
+            np.nan,
+        )
+
+        y = np.full(
+            len(out),
+            np.nan,
+        )
+
+        horizon = np.timedelta64(
+            h,
+            "m",
+        )
+
+        for i, now in enumerate(
+            times
+        ):
+
+            end = (
+                now
+                +
+                horizon
             )
-            alert_flag = bool(
-                pred_g <= (CFG["hypo_threshold"] + CFG["alert_margin"])
-                or risk_score >= CFG["risk_score_threshold"]
+
+            if end > times[-1]:
+                continue
+
+            j = np.searchsorted(
+                times,
+                end,
+                side="right",
             )
 
-            item[f"Pred_{h}m"] = round(pred_g, 1)
-            item[f"Alert_{h}m"] = alert_flag
-            if alert_flag:
-                has_alert = True
+            future = glucose[
+                i + 1 : j
+            ]
 
-        if current_raw <= CFG["hypo_threshold"]:
-            item["Status"] = "🚨 افت لحظه‌ای"
-        elif has_alert:
-            item["Status"] = "⚠️ هشدار افت"
+            if len(future) == 0:
+                continue
+
+            min_future[i] = float(
+                np.min(future)
+            )
+
+            y[i] = float(
+                min_future[i]
+                <= CFG["LOW"]
+            )
+
+        out[
+            f"Min_next_{h}m"
+        ] = min_future
+
+        out[
+            f"Y{h}"
+        ] = y
+
+    return out
+
+
+# ============================================================
+# ALERT LOGIC
+# ============================================================
+
+def apply_alert_logic(
+    segment: pd.DataFrame,
+) -> pd.DataFrame:
+
+    out = (
+        segment
+        .copy()
+        .reset_index(drop=True)
+    )
+
+    has_history = (
+        out["Timestamp"]
+        -
+        out["Timestamp"].iloc[0]
+        >=
+        pd.Timedelta(
+            minutes=CFG["LOOKBACK_MIN"]
+        )
+    )
+
+    common = (
+        has_history
+        &
+        (out["Glucose"] > CFG["LOW"])
+        &
+        (
+            out["ROC_30m"]
+            <= CFG["MIN_ROC_30"]
+        )
+        &
+        (
+            out["Risk_Score"]
+            >= CFG["RISK_THRESHOLD"]
+        )
+    )
+
+    for h in CFG["HORIZONS"]:
+
+        out[
+            f"Alert_{h}m"
+        ] = (
+            common
+            &
+            (
+                out[
+                    f"Pred_{h}m"
+                ]
+                <=
+                CFG["FORECAST_THRESHOLD"]
+            )
+        )
+
+    # --------------------------------------------------------
+    # Primary user-facing alert = 30m
+    # --------------------------------------------------------
+
+    raw_alert = (
+        out["Alert_30m"]
+        .fillna(False)
+        .to_numpy(bool)
+    )
+
+    # --------------------------------------------------------
+    # Cooldown / refractory period
+    # --------------------------------------------------------
+
+    cooldown_steps = max(
+        1,
+        int(
+            CFG["ALERT_COOLDOWN_MIN"]
+            /
+            CFG["EXPECTED_SAMPLE_MIN"]
+        ),
+    )
+
+    alert = raw_alert.copy()
+
+    last_alert_idx = -10**9
+
+    for i in np.where(
+        raw_alert
+    )[0]:
+
+        if (
+            i - last_alert_idx
+            <= cooldown_steps
+        ):
+
+            alert[i] = False
+
         else:
-            item["Status"] = "✅ ایمن"
 
-        processed.append(item)
+            last_alert_idx = i
 
-    return processed
+    out["Alert"] = alert
 
-
-# ==============================================================================
-# ۳. مدیریت State و حافظه برنامه
-# ==============================================================================
-if "records" not in st.session_state:
-    st.session_state.records = []
-
-if "start_time" not in st.session_state:
-    st.session_state.start_time = datetime.now().replace(
-        second=0, microsecond=0
+    out["Current_Low"] = (
+        out["Glucose"]
+        <= CFG["LOW"]
     )
 
-# ==============================================================================
-# ۴. نوار کناری (Sidebar): تنظیمات و ورودی داده
-# ==============================================================================
+    out["Any_Alert"] = (
+        out["Alert"]
+    )
+
+    out["Status"] = np.select(
+        [
+            out["Current_Low"],
+            out["Any_Alert"],
+            has_history,
+        ],
+        [
+            "🚨 Low فعلی",
+            "⚠️ هشدار افت",
+            "✅ بدون هشدار",
+        ],
+        default="⏳ بافر ۶۰ دقیقه‌ای",
+    )
+
+    return out
+
+
+# ============================================================
+# COMPLETE PIPELINE
+# ============================================================
+
+def process_one_segment(
+    segment: pd.DataFrame,
+) -> pd.DataFrame:
+
+    out = calculate_features(
+        segment
+    )
+
+    out = add_future_labels(
+        out
+    )
+
+    out = apply_alert_logic(
+        out
+    )
+
+    return out
+
+
+def process_dataset(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    parts = []
+
+    for segment in split_segments(
+        df
+    ):
+
+        if not segment.empty:
+
+            parts.append(
+                process_one_segment(
+                    segment
+                )
+            )
+
+    if not parts:
+        return pd.DataFrame()
+
+    return (
+        pd.concat(
+            parts,
+            ignore_index=True,
+        )
+        .sort_values(
+            "Timestamp"
+        )
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+def low_episode_starts(
+    df: pd.DataFrame,
+) -> list[int]:
+
+    low = (
+        df["Glucose"]
+        .to_numpy(float)
+        <= CFG["LOW"]
+    )
+
+    starts = np.where(
+        low
+        &
+        ~np.r_[
+            False,
+            low[:-1]
+        ]
+    )[0]
+
+    return starts.tolist()
+
+
+def alert_runs(
+    alert: np.ndarray,
+) -> list[tuple[int, int]]:
+
+    runs = []
+
+    i = 0
+
+    while i < len(alert):
+
+        if alert[i]:
+
+            start = i
+
+            while (
+                i + 1 < len(alert)
+                and alert[i + 1]
+            ):
+                i += 1
+
+            runs.append(
+                (
+                    start,
+                    i,
+                )
+            )
+
+        i += 1
+
+    return runs
+
+
+def classification_metrics(
+    df: pd.DataFrame,
+    alert_column: str,
+    horizon: int,
+    row_mask: np.ndarray | None = None,
+) -> dict:
+
+    y = (
+        df[f"Y{horizon}"]
+        .to_numpy(float)
+    )
+
+    pred = (
+        df[alert_column]
+        .fillna(False)
+        .to_numpy(bool)
+    )
+
+    glucose = (
+        df["Glucose"]
+        .to_numpy(float)
+    )
+
+    mask = (
+        ~np.isnan(y)
+        &
+        (glucose > CFG["LOW"])
+    )
+
+    if row_mask is not None:
+        mask &= row_mask
+
+    yy = y[mask].astype(int)
+    pp = pred[mask].astype(int)
+
+    tp = int(
+        (
+            (yy == 1)
+            &
+            (pp == 1)
+        ).sum()
+    )
+
+    fp = int(
+        (
+            (yy == 0)
+            &
+            (pp == 1)
+        ).sum()
+    )
+
+    fn = int(
+        (
+            (yy == 1)
+            &
+            (pp == 0)
+        ).sum()
+    )
+
+    tn = int(
+        (
+            (yy == 0)
+            &
+            (pp == 0)
+        ).sum()
+    )
+
+    precision = (
+        tp / (tp + fp)
+        if tp + fp
+        else np.nan
+    )
+
+    recall = (
+        tp / (tp + fn)
+        if tp + fn
+        else np.nan
+    )
+
+    specificity = (
+        tn / (tn + fp)
+        if tn + fp
+        else np.nan
+    )
+
+    f1 = (
+        2
+        * precision
+        * recall
+        / (
+            precision
+            +
+            recall
+        )
+        if (
+            np.isfinite(
+                precision
+            )
+            and
+            np.isfinite(
+                recall
+            )
+            and
+            precision
+            +
+            recall
+        )
+        else np.nan
+    )
+
+    return {
+        "N": len(yy),
+        "TP": tp,
+        "FP": fp,
+        "FN": fn,
+        "TN": tn,
+        "Precision": precision,
+        "Recall": recall,
+        "Specificity": specificity,
+        "F1": f1,
+    }
+
+
+def event_metrics(
+    df: pd.DataFrame,
+    alert_column: str = "Alert",
+    min_lead_min: int = 10,
+    max_lead_min: int = 60,
+) -> dict:
+
+    alerts = (
+        df[alert_column]
+        .fillna(False)
+        .to_numpy(bool)
+    )
+
+    starts = low_episode_starts(
+        df
+    )
+
+    runs = alert_runs(
+        alerts
+    )
+
+    detected_any = 0
+    detected_early = 0
+
+    leads_any = []
+    leads_early = []
+
+    matched_alert_runs = set()
+
+    for low_start in starts:
+
+        candidates = []
+
+        for j, (
+            run_start,
+            _,
+        ) in enumerate(runs):
+
+            lead = (
+                low_start
+                -
+                run_start
+            ) * CFG[
+                "EXPECTED_SAMPLE_MIN"
+            ]
+
+            if (
+                0 < lead
+                <= max_lead_min
+            ):
+
+                candidates.append(
+                    (
+                        j,
+                        lead,
+                    )
+                )
+
+        if not candidates:
+            continue
+
+        # Latest alert before the Low.
+        j, lead = candidates[-1]
+
+        matched_alert_runs.add(j)
+
+        detected_any += 1
+        leads_any.append(lead)
+
+        if lead >= min_lead_min:
+
+            detected_early += 1
+            leads_early.append(
+                lead
+            )
+
+    false_alert_runs = max(
+        0,
+        len(runs)
+        -
+        len(matched_alert_runs),
+    )
+
+    episode_count = len(
+        starts
+    )
+
+    any_recall = (
+        detected_any
+        /
+        episode_count
+        if episode_count
+        else np.nan
+    )
+
+    early_recall = (
+        detected_early
+        /
+        episode_count
+        if episode_count
+        else np.nan
+    )
+
+    duration_days = (
+        df["Timestamp"].iloc[-1]
+        -
+        df["Timestamp"].iloc[0]
+    ).total_seconds() / 86400
+
+    false_alerts_per_day = (
+        false_alert_runs
+        /
+        duration_days
+        if duration_days > 0
+        else np.nan
+    )
+
+    return {
+        "Low_Episodes": episode_count,
+
+        "Detected_any_<=60m":
+            detected_any,
+
+        "Event_Recall_any":
+            any_recall,
+
+        "Detected_with_>=10m_lead":
+            detected_early,
+
+        "Event_Recall_>=10m":
+            early_recall,
+
+        "False_Alert_Runs":
+            false_alert_runs,
+
+        "False_Alerts_per_Day":
+            false_alerts_per_day,
+
+        "Median_Lead_any":
+            (
+                float(
+                    np.median(
+                        leads_any
+                    )
+                )
+                if leads_any
+                else np.nan
+            ),
+
+        "Median_Lead_>=10m":
+            (
+                float(
+                    np.median(
+                        leads_early
+                    )
+                )
+                if leads_early
+                else np.nan
+            ),
+
+        "Lead_Times_any":
+            leads_any,
+
+        "Lead_Times_early":
+            leads_early,
+    }
+
+
+def evaluate_dataset(
+    processed: pd.DataFrame,
+) -> dict:
+
+    metrics = {}
+
+    for h in CFG["HORIZONS"]:
+
+        metrics[
+            f"{h}m_point"
+        ] = classification_metrics(
+            processed,
+            f"Alert_{h}m",
+            h,
+        )
+
+    metrics[
+        "event_30m"
+    ] = event_metrics(
+        processed,
+        alert_column="Alert",
+    )
+
+    return metrics
+
+
+# ============================================================
+# TEMPORAL HOLDOUT
+# ============================================================
+
+def temporal_split_evaluation(
+    processed: pd.DataFrame,
+) -> pd.DataFrame:
+
+    """
+    Descriptive time split:
+        60% development
+        20% validation
+        20% holdout
+
+    No retuning occurs here.
+    The final fixed parameters are evaluated as-is.
+    """
+
+    n = len(processed)
+
+    cut1 = int(
+        n * 0.60
+    )
+
+    cut2 = int(
+        n * 0.80
+    )
+
+    rows = []
+
+    for (
+        name,
+        start,
+        end,
+    ) in [
+
+        (
+            "Train/Development",
+            0,
+            cut1,
+        ),
+
+        (
+            "Validation",
+            cut1,
+            cut2,
+        ),
+
+        (
+            "Holdout/Test",
+            cut2,
+            n,
+        ),
+
+        (
+            "All",
+            0,
+            n,
+        ),
+    ]:
+
+        part = (
+            processed
+            .iloc[start:end]
+            .copy()
+        )
+
+        cm = classification_metrics(
+            processed.iloc[
+                start:end
+            ],
+            "Alert",
+            30,
+        )
+
+        em = (
+            event_metrics(
+                part,
+                "Alert",
+            )
+            if len(part)
+            else {}
+        )
+
+        rows.append(
+            {
+                "Split": name,
+
+                **cm,
+
+                "Low Episodes":
+                    em.get(
+                        "Low_Episodes",
+                        np.nan,
+                    ),
+
+                "Event Recall >=10m":
+                    em.get(
+                        "Event_Recall_>=10m",
+                        np.nan,
+                    ),
+
+                "Event Recall any <=60m":
+                    em.get(
+                        "Event_Recall_any",
+                        np.nan,
+                    ),
+
+                "False Alert Runs":
+                    em.get(
+                        "False_Alert_Runs",
+                        np.nan,
+                    ),
+
+                "Median Lead >=10m":
+                    em.get(
+                        "Median_Lead_>=10m",
+                        np.nan,
+                    ),
+            }
+        )
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+# ============================================================
+# EXPORT
+# ============================================================
+
+def make_export(
+    processed: pd.DataFrame,
+    eval_df: pd.DataFrame,
+) -> bytes:
+
+    buffer = io.BytesIO()
+
+    with pd.ExcelWriter(
+        buffer,
+        engine="openpyxl",
+    ) as writer:
+
+        processed.to_excel(
+            writer,
+            index=False,
+            sheet_name="CGM_MVP",
+        )
+
+        eval_df.to_excel(
+            writer,
+            index=False,
+            sheet_name="Evaluation",
+        )
+
+        low_rows = []
+
+        starts = low_episode_starts(
+            processed
+        )
+
+        for i, start in enumerate(
+            starts,
+            start=1,
+        ):
+
+            next_starts = [
+                s
+                for s in starts
+                if s > start
+            ]
+
+            end = (
+                next_starts[0] - 1
+                if next_starts
+                else len(processed) - 1
+            )
+
+            low_rows.append(
+                {
+                    "Episode":
+                        i,
+
+                    "Start":
+                        processed.loc[
+                            start,
+                            "Timestamp",
+                        ],
+
+                    "Start_Glucose":
+                        processed.loc[
+                            start,
+                            "Glucose",
+                        ],
+
+                    "End":
+                        processed.loc[
+                            end,
+                            "Timestamp",
+                        ],
+
+                    "Minimum":
+                        processed.loc[
+                            start:end,
+                            "Glucose",
+                        ].min(),
+                }
+            )
+
+        pd.DataFrame(
+            low_rows
+        ).to_excel(
+            writer,
+            index=False,
+            sheet_name="Low_Episodes",
+        )
+
+    return buffer.getvalue()
+
+
+# ============================================================
+# BUILT-IN DEVELOPMENT TESTS
+# ============================================================
+
+APRIL_DATASET_1 = [
+    190,181,178,174,171,169,160,149,140,136,133,129,126,122,120,117,
+    113,111,115,111,106,100,97,90,88,86,86,84,82,82,82,84,86,86,86,86,
+    88,88,79,82,90,90,97,97,97,97,97,99,97,95,95,95,77,72,72,91,90,93,
+    93,93,88,86,86,90,90,86,84,84,84,84,81,72,81,91,90,86,84,82,86,82,
+    81,79,77,73,73,72,70,72,72,79,82,81,82,82,82,79,77,81,79,82,90,91,
+    91,93,95,95,
+]
+
+
+APRIL_DATASET_2 = [
+    329,324,299,273,250,243,243,230,228,203,194,183,176,167,156,140,
+    129,118,111,106,100,97,99,93,93,91,84,86,88,88,84,81,73,68,
+]
+
+
+# ============================================================
+# APP
+# ============================================================
+
+if "data" not in st.session_state:
+
+    st.session_state.data = pd.DataFrame(
+        columns=[
+            "Timestamp",
+            "Glucose",
+        ]
+    )
+
+
+st.title(
+    "🩸 CGM Low-Glucose Early Warning — MVP v0.4"
+)
+
+st.caption(
+    "مدل ریاضی CGM-only؛ "
+    "آستانه Low = 70 mg/dL. "
+    "این پروتوتایپ ابزار تشخیص یا درمان پزشکی نیست."
+)
+
+
 with st.sidebar:
-    st.image(
-        "https://img.icons8.com/fluency/96/blood-drop.png",
-        width=60,
+
+    st.header(
+        "ورودی داده"
     )
-    st.title("کنترل‌پنل CGM")
-    st.caption("سیستم هوشمند پیش‌هشدار هیپوگلایسمی")
-    st.markdown("---")
 
     mode = st.radio(
-        "حالت ورود داده:",
-        ["ورود زنده (شبیه‌ساز ۵ دقیقه‌ای)", "آپلود فایل اکسل/CSV سنسور"],
+        "حالت",
+        [
+            "Excel / CSV",
+            "Live 5-minute",
+            "Development tests",
+        ],
     )
 
-    if mode == "ورود زنده (شبیه‌ساز ۵ دقیقه‌ای)":
-        st.subheader("ثبت قند جدید")
-        new_glucose = st.number_input(
-            "عدد قند خون (mg/dL):",
+    # --------------------------------------------------------
+    # EXCEL / CSV
+    # --------------------------------------------------------
+
+    if mode == "Excel / CSV":
+
+        uploaded = st.file_uploader(
+            "فایل CGM",
+            type=[
+                "xls",
+                "xlsx",
+                "csv",
+            ],
+        )
+
+        if uploaded is not None:
+
+            try:
+
+                st.session_state.data = (
+                    read_sensor_file(
+                        uploaded
+                    )
+                )
+
+                st.success(
+                    f"{len(st.session_state.data):,} رکورد بارگذاری شد."
+                )
+
+            except Exception as exc:
+
+                st.error(
+                    str(exc)
+                )
+
+    # --------------------------------------------------------
+    # DEVELOPMENT TESTS
+    # --------------------------------------------------------
+
+    elif mode == "Development tests":
+
+        if st.button(
+            "تست April #1",
+            use_container_width=True,
+        ):
+
+            st.session_state.data = (
+                sample_df(
+                    APRIL_DATASET_1,
+                    "2025-04-20 00:00",
+                )
+            )
+
+            st.rerun()
+
+        if st.button(
+            "تست April #2",
+            use_container_width=True,
+        ):
+
+            st.session_state.data = (
+                sample_df(
+                    APRIL_DATASET_2,
+                    "2025-04-20 00:00",
+                )
+            )
+
+            st.rerun()
+
+    # --------------------------------------------------------
+    # LIVE
+    # --------------------------------------------------------
+
+    else:
+
+        if "live_base" not in st.session_state:
+
+            st.session_state.live_base = (
+                datetime.now()
+                .replace(
+                    second=0,
+                    microsecond=0,
+                )
+            )
+
+        glucose = st.number_input(
+            "قند (mg/dL)",
             min_value=20.0,
             max_value=450.0,
             value=115.0,
             step=1.0,
         )
 
-        col_b1, col_b2 = st.columns(2)
-        with col_b1:
-            if st.button("➕ ثبت ۵ دقیقه", use_container_width=True):
-                current_step = len(st.session_state.records)
-                sim_time = st.session_state.start_time + timedelta(
-                    minutes=current_step * 5
-                )
-                st.session_state.records.append(
-                    {
-                        "Step": current_step + 1,
-                        "Time": sim_time.strftime("%H:%M"),
-                        "Raw": float(new_glucose),
-                    }
-                )
-                st.rerun()
+        if st.button(
+            "➕ ثبت ۵ دقیقه",
+            use_container_width=True,
+        ):
 
-        with col_b2:
-            if st.button("🗑️ پاکسازی", use_container_width=True):
-                st.session_state.records = []
-                st.rerun()
+            if st.session_state.data.empty:
 
-        st.markdown("---")
-        st.subheader("تست‌های آماده (تزریق سریع)")
-        if st.button("⚡ تزریق نمونه اول (افت روزانه)", use_container_width=True):
-            # دیتای تست اول
-            sample_1 = [
-                117,
-                115,
-                113,
-                117,
-                115,
-                115,
-                115,
-                113,
-                120,
-                124,
-                129,
-                129,
-                124,
-                124,
-                117,
-                109,
-                106,
-                99,
-                93,
-                88,
-                81,
-                73,
-                68,
-            ]
-            st.session_state.records = []
-            base_t = datetime.strptime("14:22", "%H:%M")
-            for i, val in enumerate(sample_1):
-                t = base_t + timedelta(minutes=i * 5)
-                st.session_state.records.append(
-                    {"Step": i + 1, "Time": t.strftime("%H:%M"), "Raw": float(val)}
+                t = (
+                    st.session_state.live_base
                 )
+
+            else:
+
+                t = (
+                    st.session_state.data.iloc[-1][
+                        "Timestamp"
+                    ]
+                    +
+                    timedelta(
+                        minutes=5
+                    )
+                )
+
+            st.session_state.data = (
+                pd.concat(
+                    [
+                        st.session_state.data,
+                        pd.DataFrame(
+                            {
+                                "Timestamp": [t],
+                                "Glucose": [glucose],
+                            }
+                        ),
+                    ],
+                    ignore_index=True,
+                )
+            )
+
             st.rerun()
 
-        if st.button("⚡ تزریق نمونه دوم (سقوط شبانه)", use_container_width=True):
-            # دیتای تست دوم
-            sample_2 = [
-                158,
-                162,
-                156,
-                151,
-                140,
-                135,
-                131,
-                136,
-                138,
-                136,
-                136,
-                124,
-                126,
-                117,
-                108,
-                99,
-                77,
-                64,
-            ]
-            st.session_state.records = []
-            base_t = datetime.strptime("23:07", "%H:%M")
-            for i, val in enumerate(sample_2):
-                t = base_t + timedelta(minutes=i * 5)
-                st.session_state.records.append(
-                    {"Step": i + 1, "Time": t.strftime("%H:%M"), "Raw": float(val)}
+        if st.button(
+            "🗑 پاک‌سازی",
+            use_container_width=True,
+        ):
+
+            st.session_state.data = (
+                pd.DataFrame(
+                    columns=[
+                        "Timestamp",
+                        "Glucose",
+                    ]
                 )
+            )
+
             st.rerun()
 
-    else:
-        uploaded_file = st.file_uploader(
-            "فایل اکسل سنسور (.xls, .xlsx, .csv):", type=["xls", "xlsx", "csv"]
-        )
-        if uploaded_file is not None:
-            try:
-                if uploaded_file.name.endswith(".csv"):
-                    df_up = pd.read_csv(uploaded_file)
-                else:
-                    df_up = pd.read_excel(uploaded_file)
 
-                time_col = df_up.columns[0]
-                glucose_col = df_up.columns[1]
+if st.session_state.data.empty:
 
-                # پردازش اولیه مقادیر قند
-                def parse_g(v):
-                    if str(v).strip().upper() == "LOW":
-                        return 39.0
-                    if str(v).strip().upper() == "HIGH":
-                        return 401.0
-                    return float(v)
-
-                df_up["Raw"] = df_up[glucose_col].apply(parse_g)
-
-                # استخراج زمان
-                clean_times = (
-                    df_up[time_col]
-                    .astype(str)
-                    .apply(lambda x: re.sub(r"\s*GMT.*", "", x).strip())
-                )
-                dt_series = pd.to_datetime(
-                    clean_times, format="%d-%m-%Y %H:%M", errors="coerce"
-                )
-                if dt_series.isna().all():
-                    dt_series = pd.to_datetime(
-                        clean_times, dayfirst=True, errors="coerce"
-                    )
-
-                df_up["Time_dt"] = dt_series
-                df_up = df_up.dropna(subset=["Time_dt", "Raw"]).sort_values(
-                    "Time_dt"
-                )
-
-                st.session_state.records = []
-                for i, row in enumerate(df_up.itertuples()):
-                    st.session_state.records.append(
-                        {
-                            "Step": i + 1,
-                            "Time": row.Time_dt.strftime("%d-%m %H:%M"),
-                            "Raw": float(row.Raw),
-                        }
-                    )
-                st.success(f"تعداد {len(df_up)} رکورد بارگذاری شد!")
-            except Exception as e:
-                st.error(f"خطا در خواندن فایل: {e}")
-
-# ==============================================================================
-# ۵. صفحه اصلی داشبورد
-# ==============================================================================
-st.title("🩸 داشبورد زنده پیش‌بینی افت قند خون (CGM Alert)")
-
-processed_data = calculate_metrics_for_stream(st.session_state.records)
-
-if not processed_data:
     st.info(
-        "👈 داده‌ای وجود ندارد. از منوی سمت راست عدد قند را ثبت کنید یا یکی از دکمه‌های «تست سریع» را بزنید."
+        "از Sidebar داده را وارد کن."
     )
-else:
-    last = processed_data[-1]
-    count = len(processed_data)
 
-    # کارت‌های متریک بالای صفحه
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 1.2])
+    st.stop()
 
-    with c1:
-        st.markdown(
-            f"""
-            <div class="metric-card">
-                <div style="color: #64748b; font-size: 13px;">آخرین زمان ثبت</div>
-                <div style="font-size: 26px; font-weight: 700; color: #1e293b; margin: 4px 0;">{last['Time']}</div>
-                <div style="color: #0284c7; font-size: 12px;">گام ۵ دقیقه‌ای #{count}</div>
-            </div>
-        """,
-            unsafe_allow_html=True,
+
+processed = process_dataset(
+    st.session_state.data
+)
+
+eval_all = evaluate_dataset(
+    processed
+)
+
+eval_split = (
+    temporal_split_evaluation(
+        processed
+    )
+)
+
+last = processed.iloc[-1]
+
+
+# ============================================================
+# TOP METRICS
+# ============================================================
+
+c1, c2, c3, c4, c5 = st.columns(5)
+
+
+c1.metric(
+    "آخرین قند",
+    f"{last['Glucose']:.0f}",
+)
+
+
+c2.metric(
+    "EMA",
+    f"{last['Smooth']:.1f}",
+)
+
+
+c3.metric(
+    "ROC 10m",
+    (
+        "-"
+        if pd.isna(
+            last["ROC_10m"]
+        )
+        else
+        f"{last['ROC_10m']:.2f}"
+    ),
+)
+
+
+c4.metric(
+    "Risk Score",
+    (
+        "-"
+        if pd.isna(
+            last["Risk_Score"]
+        )
+        else
+        f"{last['Risk_Score']:.1f}/100"
+    ),
+)
+
+
+c5.metric(
+    "وضعیت",
+    last["Status"],
+)
+
+
+# ============================================================
+# CHART
+# ============================================================
+
+fig = go.Figure()
+
+
+fig.add_trace(
+    go.Scatter(
+        x=processed["Timestamp"],
+        y=processed["Glucose"],
+        name="CGM",
+        mode="lines+markers",
+    )
+)
+
+
+fig.add_trace(
+    go.Scatter(
+        x=processed["Timestamp"],
+        y=processed["Smooth"],
+        name="EMA",
+        mode="lines",
+    )
+)
+
+
+fig.add_hline(
+    y=70,
+    line_dash="dash",
+    annotation_text="Low = 70",
+)
+
+
+if pd.notna(
+    last["Pred_30m"]
+):
+
+    future_x = [
+        last["Timestamp"]
+        +
+        timedelta(
+            minutes=h
+        )
+        for h in CFG["HORIZONS"]
+    ]
+
+    future_y = [
+        last[f"Pred_{h}m"]
+        for h in CFG["HORIZONS"]
+    ]
+
+    fig.add_trace(
+        go.Scatter(
+            x=future_x,
+            y=future_y,
+            name="Forecast",
+            mode="lines+markers",
+        )
+    )
+
+
+fig.update_layout(
+    height=420,
+    hovermode="x unified",
+)
+
+
+st.plotly_chart(
+    fig,
+    use_container_width=True,
+)
+
+
+# ============================================================
+# FORECAST CARDS
+# ============================================================
+
+fc = st.columns(3)
+
+
+for col, h in zip(
+    fc,
+    CFG["HORIZONS"],
+):
+
+    with col:
+
+        pred = last[
+            f"Pred_{h}m"
+        ]
+
+        alert = bool(
+            last[
+                f"Alert_{h}m"
+            ]
         )
 
-    with c2:
-        smooth_val = last["Smooth"] if last["Smooth"] != "-" else last["Raw"]
-        st.markdown(
-            f"""
-            <div class="metric-card">
-                <div style="color: #64748b; font-size: 13px;">قند لحظه‌ای (خام / هموار)</div>
-                <div style="font-size: 26px; font-weight: 700; color: #1e293b; margin: 4px 0;">
-                    {int(last['Raw'])} <span style="font-size: 16px; color: #64748b;">({smooth_val})</span>
-                </div>
-                <div style="color: #64748b; font-size: 12px;">mg/dL</div>
-            </div>
-        """,
-            unsafe_allow_html=True,
-        )
-
-    with c3:
-        roc_disp = f"{last['ROC_15m']} mg/dL/min" if last["ROC_15m"] != "-" else "-"
-        risk_disp = f"{last['Risk_Score']} / 100" if last["Risk_Score"] != "-" else "-"
-        st.markdown(
-            f"""
-            <div class="metric-card">
-                <div style="color: #64748b; font-size: 13px;">نرخ افت (ROC) و ریسک</div>
-                <div style="font-size: 22px; font-weight: 700; color: #1e293b; margin: 4px 0;">{roc_disp}</div>
-                <div style="color: #ea580c; font-size: 12px; font-weight: 600;">نمره ریسک: {risk_disp}</div>
-            </div>
-        """,
-            unsafe_allow_html=True,
-        )
-
-    with c4:
-        st_text = last["Status"]
-        if "ایمن" in st_text:
-            badge = f'<div class="status-badge-safe">{st_text}</div>'
-            sub = "بدون خطر افت در ۶۰ دقیقه بعد"
-        elif "هشدار" in st_text:
-            badge = f'<div class="status-badge-warn">{st_text}</div>'
-            sub = "احتمال وقوع افت قند (≤ 70)"
-        elif "افت" in st_text:
-            badge = f'<div class="status-badge-low">{st_text}</div>'
-            sub = "قند هم‌اکنون در بازه خطرناک است"
-        else:
-            badge = f'<div class="status-badge-buff">{st_text}</div>'
-            sub = f"{12 - count} نقطه تا تکمیل یک ساعت"
-
-        st.markdown(
-            f"""
-            <div class="metric-card" style="background: #fafafa;">
-                <div style="color: #64748b; font-size: 13px; margin-bottom: 6px;">وضعیت هشدار زودهنگام</div>
-                {badge}
-                <div style="color: #64748b; font-size: 11px; margin-top: 6px;">{sub}</div>
-            </div>
-        """,
-            unsafe_allow_html=True,
-        )
-
-    # --------------------------------------------------------------------------
-    # تب‌های نمایش: نمودار و جدول داده‌ها
-    # --------------------------------------------------------------------------
-    tab_chart, tab_table = st.tabs(["📈 نمودار ترند و پیش‌بینی", "📋 جدول جزئیات گام‌ها"])
-
-    with tab_chart:
-        df_p = pd.DataFrame(processed_data)
-
-        fig = go.Figure()
-
-        # خط قند خام
-        fig.add_trace(
-            go.Scatter(
-                x=df_p["Time"],
-                y=df_p["Raw"],
-                mode="lines+markers",
-                name="قند خام سنسور",
-                line=dict(color="#3b82f6", width=2),
-                marker=dict(size=6),
-            )
-        )
-
-        # خط قند هموارشده
-        fig.add_trace(
-            go.Scatter(
-                x=df_p["Time"],
-                y=df_p["Smooth"],
-                mode="lines",
-                name="هموارشده (EMA)",
-                line=dict(color="#10b981", width=2, dash="dot"),
-            )
-        )
-
-        # خط قرمز مرز هیپوگلایسمی (۷۰)
-        fig.add_hline(
-            y=70,
-            line_dash="dash",
-            line_color="#ef4444",
-            annotation_text="مرز افت قند (70 mg/dL)",
-            annotation_position="bottom right",
-        )
-
-        # نقاط پیش‌بینی آخرین گام (در صورت وجود)
-        if last["Pred_30m"] != "-":
-            last_t_idx = len(df_p) - 1
-            pred_times = ["+30m", "+45m", "+60m"]
-            pred_vals = [last["Pred_30m"], last["Pred_45m"], last["Pred_60m"]]
-
-            fig.add_trace(
-                go.Scatter(
-                    x=pred_times,
-                    y=pred_vals,
-                    mode="markers+lines",
-                    name="مسیر پیش‌بینی آینده",
-                    line=dict(color="#f59e0b", width=2, dash="dash"),
-                    marker=dict(size=10, symbol="diamond", color="#d97706"),
-                )
-            )
-
-        fig.update_layout(
-            height=420,
-            margin=dict(l=20, r=20, t=30, b=20),
-            hovermode="x unified",
-            legend=dict(
-                orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1
+        st.metric(
+            f"پیش‌بینی +{h} دقیقه",
+            (
+                "-"
+                if pd.isna(pred)
+                else
+                f"{pred:.1f} mg/dL"
             ),
-            plot_bgcolor="#f8fafc",
-            paper_bgcolor="#ffffff",
+            (
+                "⚠️ Alert"
+                if alert
+                else
+                "No alert"
+            ),
         )
-        st.plotly_chart(fig, use_container_width=True)
 
-    with tab_table:
-        # ساخت جدول شکیل برای نمایش ردیف‌ها
-        display_rows = []
-        for r in reversed(processed_data):
 
-            def style_alert(pred, alt):
-                if pred == "-":
-                    return "-"
-                if alt:
-                    return f"⚠️ {pred}"
-                return f"{pred}"
+# ============================================================
+# TABS
+# ============================================================
 
-            display_rows.append(
-                {
-                    "گام": f"#{r['Step']}",
-                    "زمان": r["Time"],
-                    "قند خام": r["Raw"],
-                    "هموار (EMA)": r["Smooth"],
-                    "نرخ افت (ROC)": r["ROC_15m"],
-                    "نمره ریسک": r["Risk_Score"],
-                    "پیش‌بینی ۳۰ دقیقه": style_alert(
-                        r["Pred_30m"], r["Alert_30m"]
-                    ),
-                    "پیش‌بینی ۴۵ دقیقه": style_alert(
-                        r["Pred_45m"], r["Alert_45m"]
-                    ),
-                    "پیش‌بینی ۶۰ دقیقه": style_alert(
-                        r["Pred_60m"], r["Alert_60m"]
-                    ),
-                    "وضعیت": r["Status"],
-                }
-            )
+tab_details, tab_eval, tab_params = (
+    st.tabs(
+        [
+            "جزئیات",
+            "ارزیابی",
+            "پارامترهای MVP",
+        ]
+    )
+)
 
-        table_df = pd.DataFrame(display_rows)
-        st.dataframe(table_df, use_container_width=True, hide_index=True)
 
-        # دانلود جدول به صورت اکسل
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            pd.DataFrame(processed_data).to_excel(
-                writer, index=False, sheet_name="CGM_Stream_Data"
-            )
+# ============================================================
+# DETAILS
+# ============================================================
 
-        st.download_button(
-            label="📥 دانلود کل داده‌های پردازش‌شده (اکسل)",
-            data=buffer.getvalue(),
-            file_name="CGM_Stream_Predictions.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+with tab_details:
+
+    columns = [
+
+        "Timestamp",
+        "Glucose",
+        "Smooth",
+
+        "ROC_10m",
+        "ROC_30m",
+
+        "Persistence_60m",
+        "Acceleration",
+
+        "Effective_Slope",
+        "Time_to_75m",
+
+        "Risk_Score",
+
+        "Pred_30m",
+        "Pred_45m",
+        "Pred_60m",
+
+        "Alert",
+        "Current_Low",
+        "Status",
+    ]
+
+    st.dataframe(
+        processed[
+            columns
+        ].sort_values(
+            "Timestamp",
+            ascending=False,
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+    export = make_export(
+        processed,
+        eval_split,
+    )
+
+
+    st.download_button(
+        "📥 دانلود Excel پردازش‌شده + Evaluation",
+        export,
+        file_name=(
+            "CGM_MVP_v04_results.xlsx"
+        ),
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+    )
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+with tab_eval:
+
+    st.subheader(
+        "Point-wise Evaluation"
+    )
+
+
+    metric_rows = []
+
+    for h in CFG["HORIZONS"]:
+
+        m = eval_all[
+            f"{h}m_point"
+        ]
+
+        metric_rows.append(
+            {
+                "Horizon":
+                    f"{h} min",
+
+                "N":
+                    m["N"],
+
+                "TP":
+                    m["TP"],
+
+                "FP":
+                    m["FP"],
+
+                "FN":
+                    m["FN"],
+
+                "TN":
+                    m["TN"],
+
+                "Precision":
+                    m["Precision"],
+
+                "Recall":
+                    m["Recall"],
+
+                "Specificity":
+                    m["Specificity"],
+
+                "F1":
+                    m["F1"],
+            }
         )
+
+
+    metric_df = pd.DataFrame(
+        metric_rows
+    )
+
+
+    for col in [
+        "Precision",
+        "Recall",
+        "Specificity",
+        "F1",
+    ]:
+
+        metric_df[col] = (
+            metric_df[col]
+            .map(
+                lambda x:
+                    f"{x * 100:.1f}%"
+                    if pd.notna(x)
+                    else "-"
+            )
+        )
+
+
+    st.dataframe(
+        metric_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+    st.subheader(
+        "Episode-level Evaluation"
+    )
+
+
+    em = eval_all[
+        "event_30m"
+    ]
+
+
+    event_rows = [
+
+        {
+            "Metric":
+                "Low episodes",
+
+            "Value":
+                em["Low_Episodes"],
+        },
+
+        {
+            "Metric":
+                "Event recall — any alert <=60m",
+
+            "Value":
+                (
+                    f"{em['Event_Recall_any'] * 100:.1f}%"
+                    if pd.notna(
+                        em[
+                            "Event_Recall_any"
+                        ]
+                    )
+                    else "-"
+                ),
+        },
+
+        {
+            "Metric":
+                "Event recall — >=10m lead",
+
+            "Value":
+                (
+                    f"{em['Event_Recall_>=10m'] * 100:.1f}%"
+                    if pd.notna(
+                        em[
+                            "Event_Recall_>=10m"
+                        ]
+                    )
+                    else "-"
+                ),
+        },
+
+        {
+            "Metric":
+                "False alert runs",
+
+            "Value":
+                em[
+                    "False_Alert_Runs"
+                ],
+        },
+
+        {
+            "Metric":
+                "False alerts / day",
+
+            "Value":
+                (
+                    f"{em['False_Alerts_per_Day']:.2f}"
+                    if pd.notna(
+                        em[
+                            "False_Alerts_per_Day"
+                        ]
+                    )
+                    else "-"
+                ),
+        },
+
+        {
+            "Metric":
+                "Median lead >=10m",
+
+            "Value":
+                (
+                    f"{em['Median_Lead_>=10m']:.0f} min"
+                    if pd.notna(
+                        em[
+                            "Median_Lead_>=10m"
+                        ]
+                    )
+                    else "-"
+                ),
+        },
+    ]
+
+
+    st.dataframe(
+        pd.DataFrame(
+            event_rows
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+    st.subheader(
+        "Temporal Holdout"
+    )
+
+
+    split_display = (
+        eval_split.copy()
+    )
+
+
+    for col in [
+        "Precision",
+        "Recall",
+        "Specificity",
+        "F1",
+        "Event Recall >=10m",
+        "Event Recall any <=60m",
+    ]:
+
+        split_display[col] = (
+            split_display[col]
+            .map(
+                lambda x:
+                    f"{x * 100:.1f}%"
+                    if pd.notna(x)
+                    else "-"
+            )
+        )
+
+
+    st.dataframe(
+        split_display,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# ============================================================
+# PARAMETER TAB
+# ============================================================
+
+with tab_params:
+
+    st.write(
+        "پارامترهای زیر نسخه‌ی توسعه‌ای MVP هستند؛ "
+        "این اعداد threshold بالینی نیستند."
+    )
+
+
+    param_rows = [
+
+        (
+            "Low threshold",
+            CFG["LOW"],
+            "mg/dL",
+        ),
+
+        (
+            "Risk threshold",
+            CFG["RISK_THRESHOLD"],
+            "0–100",
+        ),
+
+        (
+            "Forecast threshold",
+            CFG["FORECAST_THRESHOLD"],
+            "mg/dL",
+        ),
+
+        (
+            "Lookback",
+            CFG["LOOKBACK_MIN"],
+            "min",
+        ),
+
+        (
+            "Risk horizon",
+            CFG["TIME_RISK_HORIZON_MIN"],
+            "min",
+        ),
+
+        (
+            "Time-to target",
+            CFG["TIME_RISK_TARGET"],
+            "mg/dL",
+        ),
+
+        (
+            "ROC30 minimum",
+            CFG["MIN_ROC_30"],
+            "mg/dL/min",
+        ),
+
+        (
+            "Alert cooldown",
+            CFG["ALERT_COOLDOWN_MIN"],
+            "min",
+        ),
+
+        (
+            "EMA span",
+            CFG["EMA_SPAN"],
+            "samples",
+        ),
+    ]
+
+
+    st.dataframe(
+        pd.DataFrame(
+            param_rows,
+            columns=[
+                "Parameter",
+                "Value",
+                "Unit",
+            ],
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
