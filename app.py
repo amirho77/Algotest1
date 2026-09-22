@@ -3,7 +3,7 @@ import io
 import re
 import numpy as np
 import openpyxl
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 import pandas as pd
 import plotly.graph_objects as go
@@ -46,12 +46,20 @@ st.markdown(
 # ==============================================================================
 CFG = {
     "hypo_threshold": 70.0,
-    "near_miss_threshold": 75.0,  # مرز تعریف رویداد نزدیک به افت
-    "alert_margin": 5.0,  # حاشیه پیش‌بینی (75 mg/dL)
+    "near_miss_threshold": 75.0,   # مرز تعریف رویداد نزدیک به افت
+    "alert_margin": 5.0,           # حاشیه پیش‌بینی (75 mg/dL)
     "risk_score_threshold": 75.0,
     "tau_minutes": 45.0,
     "horizons": [30, 45, 60],
-    "max_phys_drop_rate": -2.5,  # سقف فیزیولوژیک پاکسازی گلوکز
+    "step_min": 5,
+    "max_gap_min": 7.5,            # [FIX 2] فاصله بیشتر از این => مرز «بخش پیوسته»‌ی جدید
+    # [FIX 4] این دیگر «سقف فیزیولوژیک واقعی» نیست (قبلاً -2.5 بود و افت‌های واقعی
+    # سریع‌تر را در پیش‌بینی دست‌کم می‌گرفت). فقط برای فیلتر خطای فاحش/خراب سنسور
+    # نگه داشته شده و خیلی گشاد است تا روند واقعی را نبرد.
+    "sensor_glitch_floor": -8.0,
+    # [FIX 5] بای‌پس «سقوط آزاد» دیگر با یک نقطه‌ی لحظه‌ای (که می‌تواند نویز/
+    # compression artifact سنسور باشد) شلیک نمی‌شود؛ باید روی ۱۰ دقیقه (۲ گام) پایدار باشد.
+    "sustained_drop_10m": -25.0,
     "w_dist": 0.35,
     "w_vel": 0.35,
     "w_acc": 0.15,
@@ -59,101 +67,130 @@ CFG = {
 }
 
 
-def calculate_metrics_for_stream(records):
+def _segments(dts, step_min, max_gap_min):
+    """[FIX 2] شماره‌ی بخش پیوسته برای هر رکورد؛ با هر گپ > max_gap_min یکی زیاد می‌شود.
+    هیچ ویژگی/میانگین/برچسبی مجاز نیست از مرز یک بخش به بخش دیگر عبور کند."""
+    seg = [0]
+    for i in range(1, len(dts)):
+        gap = (dts[i] - dts[i - 1]).total_seconds() / 60.0
+        seg.append(seg[-1] + (1 if gap > max_gap_min else 0))
+    return seg
+
+
+def calculate_metrics_for_stream(records, cfg=CFG):
     """محاسبه کینماتیک، بای‌پس سقوط آزاد و برچسب‌های بالینی چندسطحی"""
     if not records:
         return []
 
     df = pd.DataFrame(records)
-    df["Smooth"] = df["Raw"].ewm(span=3, adjust=False).mean()
-
     n = len(df)
-    processed = []
+    has_dt = "dt" in df.columns and df["dt"].notna().all()
+    seg = _segments(df["dt"].tolist(), cfg["step_min"], cfg["max_gap_min"]) if has_dt else [0] * n
+    df["Seg"] = seg
 
+    # EMA جداگانه در هر بخش پیوسته [FIX 2]
+    df["Smooth"] = df.groupby("Seg")["Raw"].transform(lambda s: s.ewm(span=3, adjust=False).mean())
+
+    def avail(i, k):
+        """آیا رکورد i-k وجود دارد و در همان بخش پیوسته‌ی i است؟"""
+        j = i - k
+        return j >= 0 and seg[j] == seg[i]
+
+    processed = []
     for i in range(n):
         item = records[i].copy()
+        item["Segment"] = seg[i]
         item["Smooth"] = round(float(df.loc[i, "Smooth"]), 1)
+        current_raw = df.loc[i, "Raw"]
+        current_smooth = df.loc[i, "Smooth"]
 
-        # دوره پر شدن بافر پایه
-        if i < 11:
+        # [FIX 1] وضعیت افت لحظه‌ای مستقل از بافر/داده‌ی کافی محاسبه می‌شود؛
+        # قبلاً اگر ۱۱ نقطه‌ی اول سشن Raw<=70 بود، سیستم فقط "بافر..." نشان می‌داد.
+        base_status = "🚨 افت لحظه‌ای" if current_raw <= cfg["hypo_threshold"] else None
+
+        roc_ready = avail(i, 3)
+        acc_ready = roc_ready and avail(i, 5)
+
+        if not roc_ready:
             item["ROC_15m"] = "-"
             item["Risk_Score"] = "-"
             item["Is_Acute_Drop"] = False
-            for h in CFG["horizons"]:
+            for h in cfg["horizons"]:
                 item[f"Pred_{h}m"] = "-"
                 item[f"Alert_{h}m"] = False
-                item[f"Outcome_{h}m"] = "-"
-            item["Status"] = f"بافر ({i+1}/12)"
+                item[f"_raw_alert_{h}"] = False
+            # [FIX 1] این وضعیت دیگر با "✅ ایمن" اشتباه گرفته نمی‌شود؛ صریحاً
+            # می‌گوید داده برای قضاوت کافی نیست (نه اینکه ایمنی تأیید شده باشد).
+            item["Status"] = base_status or "ℹ️ داده ناکافی (شروع سشن/شکاف داده)"
             processed.append(item)
             continue
 
-        current_smooth = df.loc[i, "Smooth"]
-        current_raw = df.loc[i, "Raw"]
-        prev_raw = df.loc[i - 1, "Raw"] if i >= 1 else current_raw
+        prev_raw = df.loc[i - 1, "Raw"]
         diff_5m = current_raw - prev_raw
-
-        # ۱. نرخ تغییرات و مهار نویز
         raw_roc = (current_smooth - df.loc[i - 3, "Smooth"]) / 15.0
         item["ROC_15m"] = round(float(raw_roc), 2)
-        roc_phys = np.clip(raw_roc, CFG["max_phys_drop_rate"], 3.0)
 
-        # ۲. شتاب (مشتق دوم)
-        if i >= 5:
+        # [FIX 4] بدون کلیپ فیزیولوژیک سخت‌گیرانه؛ فقط گارد خطای فاحش سنسور
+        roc_guarded = np.clip(raw_roc, cfg["sensor_glitch_floor"], 3.0)
+
+        if acc_ready:
             roc_prev = (df.loc[i - 2, "Smooth"] - df.loc[i - 5, "Smooth"]) / 15.0
             acc = (raw_roc - roc_prev) / 10.0
         else:
             acc = 0.0
 
-        # ۳. تداوم نزول
-        smooth_slice = df.loc[max(0, i - 11) : i, "Smooth"]
-        persistence = float((smooth_slice.diff() < 0).mean() * 100.0)
+        # تداوم نزول: پنجره‌ی نرم تا ۶۰ دقیقه، هرگز از مرز بخش عبور نمی‌کند [FIX 2]
+        start = i
+        while avail(start, 1) and (i - start) < 11:
+            start -= 1
+        smooth_slice = df.loc[start:i, "Smooth"]
+        persistence = float((smooth_slice.diff() < 0).mean() * 100.0) if len(smooth_slice) >= 3 else 0.0
 
-        # ۴. نمره ریسک تجمیعی
         s_dist = np.clip((180.0 - current_smooth) / 110.0 * 100.0, 0.0, 100.0)
         s_vel = np.clip(-raw_roc / 2.0 * 100.0, 0.0, 100.0)
         s_acc = np.clip(-acc / 0.1 * 100.0, 0.0, 100.0)
         risk_score = (
-            CFG["w_dist"] * s_dist
-            + CFG["w_vel"] * s_vel
-            + CFG["w_acc"] * s_acc
-            + CFG["w_persist"] * persistence
+            cfg["w_dist"] * s_dist
+            + cfg["w_vel"] * s_vel
+            + cfg["w_acc"] * s_acc
+            + cfg["w_persist"] * persistence
         )
         item["Risk_Score"] = round(float(risk_score), 1)
 
-        # ۵. پیش‌بینی کینماتیک با ترمز و بررسی شروط آلارم
+        # [FIX 5] بای‌پس سقوط آزاد: باید افت روی ۱۰ دقیقه (۲ گام پیاپی، هر دو نزولی) پایدار باشد
+        diff_10m = current_raw - df.loc[i - 2, "Raw"] if avail(i, 2) else 0.0
+        sustained_drop = (
+            avail(i, 2)
+            and (diff_5m < 0)
+            and (prev_raw - df.loc[i - 2, "Raw"] < 0)
+            and (diff_10m <= cfg["sustained_drop_10m"])
+        )
+
         has_alert = False
         has_acute = False
 
-        for h in CFG["horizons"]:
-            tau = CFG["tau_minutes"]
+        for h in cfg["horizons"]:
+            tau = cfg["tau_minutes"]
             h_eff = tau * (1.0 - np.exp(-h / tau))
 
-            if roc_phys < 0 and acc > 0:
-                braking_adjustment = np.clip(
-                    0.5 * acc * h_eff, 0.0, -0.7 * roc_phys
-                )
-                v_eff = roc_phys + braking_adjustment
+            if roc_guarded < 0 and acc > 0:
+                braking_adjustment = np.clip(0.5 * acc * h_eff, 0.0, -0.7 * roc_guarded)
+                v_eff = roc_guarded + braking_adjustment
             else:
-                v_eff = roc_phys
+                v_eff = roc_guarded
 
-            pred_g = float(
-                np.clip(current_smooth + v_eff * h_eff, 20.0, 400.0)
-            )
+            pred_g = float(np.clip(current_smooth + v_eff * h_eff, 20.0, 400.0))
             raw_alert = (
-                pred_g <= (CFG["hypo_threshold"] + CFG["alert_margin"])
-            ) or (risk_score >= CFG["risk_score_threshold"])
+                pred_g <= (cfg["hypo_threshold"] + cfg["alert_margin"])
+            ) or (risk_score >= cfg["risk_score_threshold"])
 
-            # --- گام ۱: بای‌پس هوشمند سقوط آزاد تک‌گام (Acute Plunge Bypass) ---
-            # اگر در ۵ دقیقه بیش از ۲۰ واحد افت رخ دهد یا قند <= ۸۰ با پیش‌بینی زیر ۷۰ باشد
             is_acute_plunge = (
                 (raw_roc < -1.5)
-                or (diff_5m <= -20.0)
+                or sustained_drop
                 or (current_raw <= 80.0 and pred_g <= 70.0)
             )
 
-            prev_raw_alert = (
-                processed[i - 1].get(f"_raw_alert_{h}", False) if i >= 1 else False
-            )
+            prev_raw_alert = processed[i - 1].get(f"_raw_alert_{h}", False) if avail(i, 1) else False
             confirmed_alert = bool(
                 (raw_alert and prev_raw_alert) or (raw_alert and is_acute_plunge)
             )
@@ -169,9 +206,8 @@ def calculate_metrics_for_stream(records):
 
         item["Is_Acute_Drop"] = has_acute
 
-        # وضعیت بصری لحظه‌ای
-        if current_raw <= CFG["hypo_threshold"]:
-            item["Status"] = "🚨 افت لحظه‌ای"
+        if base_status:
+            item["Status"] = base_status
         elif has_acute:
             item["Status"] = "⚡ هشدار سقوط پرشتاب"
         elif has_alert:
@@ -181,31 +217,33 @@ def calculate_metrics_for_stream(records):
 
         processed.append(item)
 
-    # --- گام ۲: محاسبه برچسب‌های بالینی چندسطحی (Ground Truth & Outcomes) ---
-    # در صورتی که نقاط بعدی در بافر وجود داشته باشند (مثلاً هنگام آپلود فایل)
-    for h in CFG["horizons"]:
-        steps = int(h / 5)
+    # --- محاسبه برچسب‌های بالینی چندسطحی (Ground Truth & Outcomes) ---
+    # [FIX 2] پنجره‌ی آینده هرگز از یک بخش پیوسته عبور نمی‌کند
+    for h in cfg["horizons"]:
+        steps = int(h / cfg["step_min"])
         for i in range(n):
-            if i + steps < n:
-                window_vals = [processed[k]["Raw"] for k in range(i + 1, i + steps + 1)]
+            j_end = i + steps
+            window_ok = j_end < n and all(seg[k] == seg[i] for k in range(i, j_end + 1))
+            if window_ok:
+                window_vals = [processed[k]["Raw"] for k in range(i + 1, j_end + 1)]
                 min_next = min(window_vals)
                 processed[i][f"Min_next_{h}m"] = round(min_next, 1)
 
                 cur_r = processed[i]["Raw"]
                 alt = processed[i][f"Alert_{h}m"]
 
-                if cur_r <= CFG["hypo_threshold"]:
+                if cur_r <= cfg["hypo_threshold"]:
                     outcome = "AlreadyLow"
                 else:
                     if alt:
-                        if min_next <= CFG["hypo_threshold"]:
+                        if min_next <= cfg["hypo_threshold"]:
                             outcome = "TP"
-                        elif min_next <= CFG["near_miss_threshold"]:
+                        elif min_next <= cfg["near_miss_threshold"]:
                             outcome = "Near-Miss"
                         else:
                             outcome = "FP"
                     else:
-                        if min_next <= CFG["hypo_threshold"]:
+                        if min_next <= cfg["hypo_threshold"]:
                             outcome = "FN"
                         else:
                             outcome = "TN"
@@ -220,10 +258,9 @@ def calculate_metrics_for_stream(records):
 # ==============================================================================
 # ۳. تولید اکسل اختصاصی با شیت‌های Analysis و Clinical_Summary
 # ==============================================================================
-def create_multilevel_excel_report(processed_records):
+def create_multilevel_excel_report(processed_records, cfg=CFG):
     wb = openpyxl.Workbook()
 
-    # استایل‌ها
     header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF", size=11)
     center_align = Alignment(horizontal="center", vertical="center")
@@ -242,9 +279,11 @@ def create_multilevel_excel_report(processed_records):
     ws_analysis.title = "Analysis"
     ws_analysis.views.sheetView[0].showGridLines = True
 
+    # [FIX 3] ستون زمان دیگر رشته‌ی متنیِ بدون‌سال نیست؛ خودِ آبجکت datetime نوشته
+    # می‌شود تا اکسل آن را تاریخ واقعی بشناسد (فیلتر/مرتب‌سازی/نمودار زمانی کار کند).
     ordered_cols = [
         ("Step", "گام"),
-        ("Time", "زمان"),
+        ("dt", "زمان"),
         ("Raw", "قند خام"),
         ("Smooth", "هموار (EMA)"),
         ("ROC_15m", "نرخ تغییر (ROC)"),
@@ -264,8 +303,11 @@ def create_multilevel_excel_report(processed_records):
         ("Outcome_60m", "نتیجه بالینی ۶۰ دقیقه"),
         ("Status", "وضعیت سیستم"),
     ]
+    has_dt = all("dt" in r for r in processed_records) and len(processed_records) > 0
 
-    for c_idx, (_, col_name) in enumerate(ordered_cols, start=1):
+    for c_idx, (col_key, col_name) in enumerate(ordered_cols, start=1):
+        if col_key == "dt" and not has_dt:
+            col_name = "زمان (متن)"
         cell = ws_analysis.cell(row=1, column=c_idx, value=col_name)
         cell.fill = header_fill
         cell.font = header_font
@@ -273,8 +315,18 @@ def create_multilevel_excel_report(processed_records):
 
     for r_idx, r in enumerate(processed_records, start=2):
         for c_idx, (col_key, _) in enumerate(ordered_cols, start=1):
-            val = r.get(col_key, None)
             cell = ws_analysis.cell(row=r_idx, column=c_idx)
+
+            if col_key == "dt":
+                if has_dt and r.get("dt") is not None:
+                    cell.value = r["dt"].to_pydatetime() if hasattr(r["dt"], "to_pydatetime") else r["dt"]
+                    cell.number_format = "DD-MM-YYYY HH:MM"
+                else:
+                    cell.value = r.get("Time", "-")
+                cell.alignment = center_align
+                continue
+
+            val = r.get(col_key, None)
 
             if col_key == "Is_Acute_Drop":
                 cell.value = "بله" if val else "-"
@@ -287,7 +339,6 @@ def create_multilevel_excel_report(processed_records):
 
             cell.alignment = center_align
 
-            # رنگ‌آمیزی شرطی ستون‌های نتایج بالینی
             if "Outcome_" in col_key and str(val) in fills:
                 cell.fill = fills[str(val)]
                 cell.font = Font(bold=True)
@@ -299,9 +350,8 @@ def create_multilevel_excel_report(processed_records):
     ws_summary = wb.create_sheet(title="Clinical_Summary")
     ws_summary.views.sheetView[0].showGridLines = True
 
-    # محاسبه شاخص‌های رویداد و ردیف
     df_all = pd.DataFrame(processed_records)
-    hypos = df_all[df_all["Raw"] <= CFG["hypo_threshold"]].copy()
+    hypos = df_all[df_all["Raw"] <= cfg["hypo_threshold"]].copy()
     episodes = []
     if len(hypos) > 0 and "dt" in df_all.columns:
         hypos["time_diff"] = hypos["dt"].diff().dt.total_seconds()
@@ -316,13 +366,15 @@ def create_multilevel_excel_report(processed_records):
         ["تعداد کل خوانش‌های ۵ دقیقه‌ای", len(processed_records)],
         ["تعداد کل رویدادهای مستقل افت قند خون (<= 70 mg/dL)", total_episodes],
         [],
+        # [FIX 6] «پوشش رویداد» (سطح اپیزود) و «بازیابی/Recall» (سطح ردیف) این‌بار
+        # کنار هم با یک یادداشت توضیحی می‌آیند تا با هم اشتباه گرفته نشوند.
         [
             "افق پیش‌بینی",
-            "پوشش رویداد (Capture Rate)",
+            "پوشش رویداد (Capture Rate — سطح اپیزود)",
             "میانگین پیش‌هشدار (دقیقه)",
-            "دقت بالینی با Near-Miss (قند <= 75)",
-            "دقت سخت‌گیرانه (قند <= 70)",
-            "بازیابی (Recall)",
+            "بازیابی ردیفی (Recall — سطح تک‌خوانش)",
+            "دقت گسترده (Near-Miss تا ۷۵ هم حساب)",
+            "دقت سخت‌گیرانه (فقط ≤70)",
             "مثبت قطعی (TP)",
             "نزدیک افت (Near-Miss: 71-75)",
             "هشدار کاذب خالص (FP: >75)",
@@ -331,7 +383,7 @@ def create_multilevel_excel_report(processed_records):
         ],
     ]
 
-    for h in CFG["horizons"]:
+    for h in cfg["horizons"]:
         eval_rows = [r for r in processed_records if r.get(f"Outcome_{h}m") not in ["AlreadyLow", "-", None]]
         tp = sum(1 for r in eval_rows if r[f"Outcome_{h}m"] == "TP")
         near_miss = sum(1 for r in eval_rows if r[f"Outcome_{h}m"] == "Near-Miss")
@@ -343,14 +395,18 @@ def create_multilevel_excel_report(processed_records):
         clin_prec = ((tp + near_miss) / (tp + near_miss + fp) * 100.0) if (tp + near_miss + fp) > 0 else 0.0
         recall = (tp / (tp + fn) * 100.0) if (tp + fn) > 0 else 0.0
 
-        # محاسبه لیدتایم رویداد
         captured = 0
         lead_times = []
         if total_episodes > 0 and "dt" in df_all.columns:
             for ep in episodes:
                 w_start = ep - pd.Timedelta(minutes=h)
                 w_end = ep - pd.Timedelta(minutes=5)
-                alts = df_all[(df_all["dt"] >= w_start) & (df_all["dt"] <= w_end) & (df_all[f"Alert_{h}m"] == True) & (df_all["Raw"] > 70.0)]
+                alts = df_all[
+                    (df_all["dt"] >= w_start)
+                    & (df_all["dt"] <= w_end)
+                    & (df_all[f"Alert_{h}m"] == True)
+                    & (df_all["Raw"] > 70.0)
+                ]
                 if len(alts) > 0:
                     captured += 1
                     lead_times.append((ep - alts["dt"].min()).total_seconds() / 60.0)
@@ -362,9 +418,9 @@ def create_multilevel_excel_report(processed_records):
             f"{h} دقیقه",
             cap_str,
             lead_str,
+            f"{recall:.1f}%",
             f"{clin_prec:.1f}%",
             f"{strict_prec:.1f}%",
-            f"{recall:.1f}%",
             tp,
             near_miss,
             fp,
@@ -374,25 +430,35 @@ def create_multilevel_excel_report(processed_records):
 
     summary_rows.extend([
         [],
+        # [FIX 6] یادداشت توضیحی برای جلوگیری از تفسیر متناقض دو معیار
+        ["نکته:", "«پوشش رویداد» یعنی چند درصد از افت‌های مستقل، حداقل یک‌بار قبل از وقوع هشدار گرفتند "
+                  "(معیار مهم برای ایمنی بیمار). «بازیابی ردیفی» سخت‌گیرانه‌تر است: چه درصدی از تک‌تک "
+                  "خوانش‌های ۵ دقیقه‌ای که باید هشدار می‌گرفتند، هشدار گرفتند. عدد اول معمولاً بالاتر است "
+                  "چون یک اپیزود می‌تواند با فقط یکی-دو هشدار هم «پوشش داده‌شده» حساب شود."],
+        [],
         ["تعاریف و استانداردهای بالینی ارزیابی:", ""],
         ["۱. مثبت قطعی (TP):", "قند خون در بازه آینده به کمتر یا مساوی ۷۰ mg/dL رسیده است."],
         ["۲. نزدیک به افت (Near-Miss):", "هشدار داده شده و قند به ۷۱ تا ۷۵ mg/dL افت کرده است (مفید بالینی برای پیشگیری)."],
         ["۳. هشدار کاذب خالص (FP):", "هشدار شلیک شده اما قند خون بالای ۷۵ mg/dL مانده است."],
-        ["۴. دقت بالینی (Clinical Precision):", "سهم هشدارهای به موقع که به افت یا لبه افت ختم شده‌اند: (TP + NearMiss) / کل هشدارها"],
+        ["۴. دقت گسترده:", "سهم هشدارهای به‌موقع که به افت یا لبه افت ختم شده‌اند: (TP + NearMiss) / کل هشدارها."],
     ])
 
     for r_idx, row_vals in enumerate(summary_rows, start=1):
         for c_idx, val in enumerate(row_vals, start=1):
             cell = ws_summary.cell(row=r_idx, column=c_idx, value=val)
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
             if r_idx in [1, 2, 6]:
                 cell.font = Font(bold=True)
                 cell.fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
+
+    ws_summary.column_dimensions["B"].width = 34
 
     for ws in [ws_analysis, ws_summary]:
         for col in ws.columns:
             col_letter = get_column_letter(col[0].column)
             max_len = max(len(str(c.value or "")) for c in col[:50])
             ws.column_dimensions[col_letter].width = max(max_len + 3, 14)
+    ws_analysis.column_dimensions["B"].width = 17
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -470,18 +536,34 @@ with st.sidebar:
 
                 df_up["Time_dt"] = dt_series
                 df_up = df_up.dropna(subset=["Time_dt", "Raw"]).sort_values("Time_dt")
+                df_up = df_up.drop_duplicates(subset=["Time_dt"], keep="last")
+
+                # [FIX 2] یکنواخت‌سازی روی شبکه‌ی ۵ دقیقه: فقط شکاف‌های کوتاه (≤۱۵ دقیقه)
+                # درون‌یابی می‌شوند؛ شکاف‌های بلندتر رها می‌شوند تا در calculate_metrics_for_stream
+                # به‌عنوان «بخش پیوسته‌ی جدید» شناسایی شوند و هیچ محاسبه‌ای از رویشان عبور نکند.
+                gs = (
+                    df_up.set_index("Time_dt")["Raw"]
+                    .resample("5min", origin="start")
+                    .mean()
+                )
+                na = gs.isna()
+                run_id = (na != na.shift()).cumsum()
+                run_len = na.groupby(run_id).transform("sum")
+                fillable = na & (run_len <= 3)  # حداکثر ۳ گام = ۱۵ دقیقه
+                gs = gs.where(~fillable, gs.interpolate(limit_area="inside"))
+                gs = gs.dropna()
 
                 st.session_state.records = []
-                for i, row in enumerate(df_up.itertuples()):
+                for i, (t, v) in enumerate(gs.items()):
                     st.session_state.records.append(
                         {
                             "Step": i + 1,
-                            "Time": row.Time_dt.strftime("%d-%m %H:%M"),
-                            "Raw": float(row.Raw),
-                            "dt": row.Time_dt,
+                            "Time": t.strftime("%d-%m %H:%M"),
+                            "Raw": float(v),
+                            "dt": t,
                         }
                     )
-                st.success(f"{len(df_up)} رکورد بارگذاری شد.")
+                st.success(f"{len(gs)} رکورد روی شبکه‌ی ۵ دقیقه بارگذاری شد.")
             except Exception as e:
                 st.error(f"خطا در خواندن فایل: {e}")
 
@@ -629,6 +711,11 @@ else:
     with tab_clinical:
         st.subheader("تحلیل تفکیکی هشدارهای بالینی (چندسطحی)")
         st.caption("تمایز میان افت‌های قطعی (TP)، موارد نزدیک به افت مفید (Near-Miss: 71-75) و هشدارهای اشتباه خالص (FP: >75)")
+        st.caption(
+            "ℹ️ «پوشش رویداد» (چند درصد افت‌های واقعی حداقل یک‌بار قبلش هشدار گرفتند) معمولاً از "
+            "«بازیابی ردیفی» (چند درصد تک‌تک ردیف‌های واجب هشدار گرفتند) بالاتر است — هر دو را در "
+            "فایل اکسل خروجی، شیت Clinical_Summary، کنار هم ببینید."
+        )
 
         clin_summary = []
         for h in [30, 45, 60]:
@@ -645,9 +732,9 @@ else:
 
             clin_summary.append({
                 "افق": f"{h} دقیقه",
-                "دقت بالینی (<=75)": f"{clin_p:.1f}%",
+                "دقت گسترده (<=75)": f"{clin_p:.1f}%",
                 "دقت سخت‌گیرانه (<=70)": f"{strict_p:.1f}%",
-                "بازیابی (Recall)": f"{rec:.1f}%",
+                "بازیابی ردیفی (Recall)": f"{rec:.1f}%",
                 "مثبت قطعی (TP)": tp,
                 "نزدیک به افت (Near-Miss)": nm,
                 "هشدار کاذب خالص (FP)": fp,
@@ -657,7 +744,6 @@ else:
 
         st.table(pd.DataFrame(clin_summary))
 
-    # دکمه دانلود اکسل دو شیته کامل
     excel_bytes = create_multilevel_excel_report(processed_data)
     st.download_button(
         label="📥 دانلود فایل اکسل جامع (همراه با شیت تحلیل بالینی دوگانه)",
