@@ -1,0 +1,15 @@
+{
+  "version": "3.0.0-research",
+  "numeric_forecast": "v2 robust multi-window slope, unchanged",
+  "preventive_rules": {
+    "near_low_margin_mg_dL": 5,
+    "recurrence_margin_mg_dL": 10,
+    "fast_drop_max_distance_mg_dL": 30,
+    "fast_drop_rate_mg_dL_per_min": 1,
+    "minimum_valid_points": 3,
+    "requires_contiguous_bins": true
+  },
+  "interpretation": "Alert_H is Forecast_Alert_H OR Preventive_Alert. Preventive_Alert is a risk guard, not a calibrated horizon forecast.",
+  "notification": "15-minute cooldown; higher priority or recovery from low may re-notify",
+  "clinical_claim": "None; no medication recommendation, no calibrated probability, no external validation"
+}
