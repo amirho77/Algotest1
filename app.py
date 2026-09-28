@@ -24,12 +24,26 @@ st.warning("این ابزار برای اطلاع‌رسانی روند است؛
 
 with st.sidebar:
     st.header("۱) ورود داده")
-    demo = st.checkbox("نمایش نمونه آموزشی")
-    upload = st.file_uploader("فایل داده CGM را انتخاب کنید", type=["csv", "xlsx", "xls"])
+    source = st.radio("روش ورود داده", ["فایل CGM", "ورود دستی", "نمونه آموزشی"], index=0)
+    demo = source == "نمونه آموزشی"
+    upload = st.file_uploader("فایل داده CGM را انتخاب کنید", type=["csv", "xlsx", "xls"]) if source == "فایل CGM" else None
     method_label = st.selectbox("نوع بررسی", ["پیشنهاد MVP (متعادل)", "حساسیت بیشتر", "هشدارهای محافظه‌کارانه"])
     method = {"پیشنهاد MVP (متعادل)":"recovery", "حساسیت بیشتر":"enhanced", "هشدارهای محافظه‌کارانه":"precision"}[method_label]
 
-if demo:
+if source == "ورود دستی":
+    st.subheader("ورود دستی سری زمانی")
+    st.caption("هر ردیف یک خوانش است؛ فاصله زمانی خوانش‌ها به‌صورت خودکار ۵ دقیقه در نظر گرفته می‌شود.")
+    n_manual = st.number_input("تعداد خوانش‌ها", min_value=12, max_value=288, value=24, step=1)
+    manual = pd.DataFrame({"شماره خوانش": range(1, int(n_manual) + 1), "قند (mg/dL)": [140.0] * int(n_manual)})
+    manual = st.data_editor(manual, num_rows="fixed", use_container_width=True, hide_index=True,
+                            column_config={"شماره خوانش": st.column_config.NumberColumn("خوانش", disabled=True),
+                                           "قند (mg/dL)": st.column_config.NumberColumn("قند (mg/dL)", min_value=20, max_value=400, step=1, format="%.0f")})
+    values = pd.to_numeric(manual["قند (mg/dL)"], errors="coerce")
+    if values.isna().any(): st.error("همه ردیف‌ها باید عدد قند داشته باشند."); st.stop()
+    end = pd.Timestamp.now(tz="UTC").floor("5min")
+    frame = pd.DataFrame({"زمان": pd.date_range(end - pd.Timedelta(minutes=5 * (len(values)-1)), end, freq="5min"), "قند": values.to_numpy()})
+    time_col, glucose_col, ids, original_count = "زمان", "قند", [], len(values)
+elif demo:
     frame = pd.DataFrame({"زمان":pd.date_range("2026-01-01", periods=60, freq="5min", tz="UTC"), "قند": [180-i*1.7 for i in range(60)]})
     st.info("این فقط نمونه آموزشی است و برای تصمیم درباره بیمار استفاده نمی‌شود.")
 elif upload:
@@ -42,8 +56,9 @@ else:
 if frame.empty or len(frame.columns)<2: st.error("فایل باید حداقل دو ستون داشته باشد."); st.stop()
 with st.sidebar:
     st.header("۲) معرفی ستون‌ها")
-    time_col = st.selectbox("کدام ستون زمان است؟", frame.columns)
-    glucose_col = st.selectbox("کدام ستون عدد قند است؟", frame.columns, index=1)
+    if source != "ورود دستی":
+        time_col = st.selectbox("کدام ستون زمان است؟", frame.columns)
+        glucose_col = st.selectbox("کدام ستون عدد قند است؟", frame.columns, index=1)
     other = [c for c in frame.columns if c not in (time_col, glucose_col)]
     known = [c for c in other if str(c).lower() in ("patient_id","subject_id","sensor_id","session_id")]
     ids = st.multiselect("شناسه بیمار یا سنسور (اختیاری)", other, default=known)
@@ -52,7 +67,7 @@ with st.sidebar:
         values=frame[column].dropna().unique().tolist()
         if not values: st.error(f"ستون {column} شناسه معتبر ندارد."); st.stop()
         selected=st.selectbox(f"انتخاب {column}", values); frame=frame.loc[frame[column].eq(selected)]
-    if not ids and not demo:
+    if not ids and not demo and source != "ورود دستی":
         st.checkbox("فایل فقط مربوط به یک بیمار/سنسور است", key="single_stream")
     unit=st.selectbox("واحد عدد قند", ["mg/dL","mmol/L"])
     timezone=st.text_input("منطقه زمانی داده", "Asia/Tehran")
@@ -62,7 +77,7 @@ with st.sidebar:
         use_bounds=st.checkbox("حد پایین/بالای سنسور مشخص است")
         lower=st.number_input("حد پایین mg/dL", min_value=1., value=40.) if use_bounds else None
         upper=st.number_input("حد بالا mg/dL", min_value=2., value=400.) if use_bounds else None
-if not ids and not demo and not st.session_state.get("single_stream",False):
+if not ids and not demo and source != "ورود دستی" and not st.session_state.get("single_stream",False):
     st.info("برای جلوگیری از ترکیب داده چند نفر، تک‌جریانی بودن فایل را تأیید کنید یا شناسه انتخاب کنید."); st.stop()
 
 try:
