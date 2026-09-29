@@ -137,7 +137,7 @@ table = pd.DataFrame({
     "هشدار ۳۰ دقیقه": view["Alert_30m"].map({1:"بله",0:"خیر"}),
     "پیام کاربر": [_message(view.iloc[i]) for i in range(len(view))],
 }, index=view.index)
-st.dataframe(table.tail(500), use_container_width=True, hide_index=True)
+st.dataframe(table, use_container_width=True, hide_index=True)
 
 st.header("ارزیابی همین فایل")
 if source == "ورود دستی":
