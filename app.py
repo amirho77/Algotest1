@@ -110,6 +110,72 @@ with st.expander("چطور به این نتیجه رسیدیم؟", expanded=Fals
 fig=go.Figure(); fig.add_scatter(x=analysis.index,y=analysis["Raw"],name="عدد خام سنسور",connectgaps=False); fig.add_scatter(x=analysis.index,y=analysis["Current_Glucose"],name="روند صاف‌شده",connectgaps=False); fig.add_hline(y=70,line_color="red",line_dash="dash",annotation_text="مرز افت ۷۰"); fig.update_layout(height=420,hovermode="x unified",xaxis_title="زمان",yaxis_title="mg/dL",legend_title="توضیح نمودار")
 st.plotly_chart(fig,use_container_width=True)
 
+st.header("جدول تصمیم‌های مدل")
+st.caption("هر ردیف یک خوانش پنج‌دقیقه‌ای است. ستون «پیام کاربر» نشان می‌دهد اگر همان لحظه اعلان ارسال شود، متن قابل نمایش چه خواهد بود.")
+def _trend(v):
+    if pd.isna(v): return "سابقه کافی نیست"
+    if v < -0.10: return "نزولی"
+    if v > 0.10: return "صعودی"
+    return "تقریباً ثابت"
+def _message(r):
+    if bool(r.get("Notification_30m", False)):
+        if bool(r.get("Fast_Drop_Risk", False)): return "افت سریع دیده شد؛ روند قند را فوراً بررسی کنید."
+        if bool(r.get("Preventive_Alert", False)): return "روند نزولی پایدار است؛ قند را زودتر بررسی کنید."
+        return "ادامه روند فعلی می‌تواند به افت قند منجر شود؛ روند را بررسی کنید."
+    if bool(r.get("Alert_30m", 0) == 1): return "روند نیازمند پایش است؛ هنوز اعلان اصلی ارسال نشده است."
+    return "اعلان فعالی نیست."
+view = analysis.copy()
+table = pd.DataFrame({
+    "زمان": view.index.astype(str),
+    "قند ثبت‌شده": view["Raw"].round(1),
+    "قند هموارشده": view["Current_Glucose"].round(1),
+    "روند ۱۵ دقیقه": view["ROC_15m"].map(_trend),
+    "شیب (واحد/دقیقه)": view["ROC_15m"].round(2),
+    "پیش‌بینی ۳۰ دقیقه": view["Pred_Glucose_30m"].round(1),
+    "پیش‌بینی ۴۵ دقیقه": view["Pred_Glucose_45m"].round(1),
+    "پیش‌بینی ۶۰ دقیقه": view["Pred_Glucose_60m"].round(1),
+    "هشدار ۳۰ دقیقه": view["Alert_30m"].map({1:"بله",0:"خیر"}),
+    "پیام کاربر": [_message(view.iloc[i]) for i in range(len(view))],
+}, index=view.index)
+st.dataframe(table.tail(500), use_container_width=True, hide_index=True)
+
+st.header("ارزیابی همین فایل")
+if source == "ورود دستی":
+    st.info("در ورود دستی آینده واقعی وجود ندارد؛ بنابراین درست/غلط بودن هشدار و امتیاز عملکرد تا زمانی که خوانش‌های بعدی وارد نشوند قابل محاسبه نیست.")
+else:
+    r30 = rows.loc[rows["Horizon_min"].eq(30)].iloc[0]
+    e30 = event_summary.loc[event_summary["Horizon_min"].eq(30)].iloc[0]
+    captured = int(e30["Captured"]); eligible = int(e30["Eligible_events"]); missed = int(e30["Missed_eligible"] + e30["No_opportunity"])
+    false_alerts = int(r30["Notification_FP"])
+    precision = float(r30["Precision"]) if pd.notna(r30["Precision"]) else 0.0
+    recall = float(e30["Recall_eligible_events"]) if pd.notna(e30["Recall_eligible_events"]) else 0.0
+    score = max(0, min(100, round(100 * (0.55 * recall + 0.35 * precision + 0.10 * max(0, 1 - false_alerts / max(1, int(r30["Notification_TP"] + false_alerts)))))))
+    m1,m2,m3,m4,m5=st.columns(5)
+    m1.metric("افت واقعی شناسایی‌شده", captured)
+    m2.metric("افت قابل تشخیص از دست‌رفته", missed)
+    m3.metric("هشدار کاذب", false_alerts)
+    m4.metric("دقت هشدار", f"{precision*100:.1f}%")
+    m5.metric("امتیاز این فایل", f"{score}/100")
+    notes=[]
+    if recall < .80: notes.append("بخشی از افت‌های واقعی قبل از هشدار از دست رفته‌اند؛ حساسیت باید بررسی شود.")
+    if precision < .50: notes.append("هشدار کاذب زیاد است؛ برگشت قند و روندهای ناپایدار علت محتمل هستند.")
+    if not notes: notes.append("تعادل حساسیت و دقت در این فایل قابل قبول است، اما نتیجه جایگزین اعتبارسنجی بالینی نیست.")
+    st.markdown("**نقد خودکار فایل:** " + " ".join(notes))
+
+with st.expander("فرمول‌ها و معنی شاخص‌ها"):
+    st.markdown("""
+**مرز افت:** قند ۷۰ mg/dL یا کمتر.  
+**شیب:** تغییر متوسط قند در ۱۵ دقیقه اخیر؛ عدد منفی یعنی روند نزولی.  
+**شتاب:** تغییر خودِ شیب؛ مثبت‌شدن آن می‌تواند نشانه کندشدن افت یا برگشت قند باشد.  
+**تداوم نزول:** درصد تغییرات نزولی در حدود یک ساعت اخیر.  
+**پیش‌بینی:** قند فعلی + شیب پایدار × تعداد دقیقه آینده.  
+**افت واقعی:** کمترین قند ثبت‌شده در پنجره آینده به ۷۰ یا کمتر برسد.  
+**حساسیت:** چند درصد افت‌های واقعی شناسایی شده‌اند.  
+**دقت:** چند درصد اعلان‌ها واقعاً با افت همراه بوده‌اند.  
+**هشدار کاذب:** اعلان صادر شده اما در پنجره بررسی افت واقعی رخ نداده است.  
+**امتیاز فایل:** ترکیبی از حساسیت، دقت و جریمه هشدار کاذب است؛ احتمال پزشکی نیست.
+    """)
+
 with st.expander("جزئیات فنی و ارزیابی مدل (اختیاری)"):
     st.caption("این بخش برای بررسی فنی است. جدول‌های اصلی عمداً مخفی هستند تا استفاده روزمره ساده بماند.")
     st.write("خلاصه رویدادهای افت"); st.dataframe(event_summary,use_container_width=True,hide_index=True)
