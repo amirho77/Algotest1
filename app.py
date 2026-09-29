@@ -1,4 +1,5 @@
 """CGM hypoglycaemia MVP dashboard: user-facing Streamlit surface."""
+import io
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -46,13 +47,35 @@ def trend_label(roc):
     return "تقریباً ثابت"
 
 
+@st.cache_data(show_spinner=False)
+def load_uploaded_file(content, filename):
+    """Avoid repeated Excel parsing on every Streamlit interaction."""
+    buffer = io.BytesIO(content)
+    return pd.read_csv(buffer) if filename.lower().endswith(".csv") else pd.read_excel(buffer)
+
+
+@st.cache_data(show_spinner="در حال تحلیل فایل…")
+def run_analysis(frame, time_column, glucose_column, timezone_name, unit_name, stream_column_names, model_method):
+    inputs = InputConfig(timezone=timezone_name, unit=unit_name)
+    config = ModelConfig()
+    return analyze(frame, time_column, glucose_column, inputs, config,
+                   stream_columns=list(stream_column_names), method=model_method)
+
+
+if "upload_nonce" not in st.session_state:
+    st.session_state.upload_nonce = 0
+
+
 st.markdown("""<div class="topbar"><h1>پلتفرم پایش افت قند</h1><p>روند قند را بخوانید، هشدارهای مدل را ببینید و عملکرد همان فایل را ارزیابی کنید.</p></div>""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("ورود داده")
+    if st.button("＋ تحلیل فایل جدید", use_container_width=True, help="فایل قبلی را از صفحه حذف می‌کند"):
+        st.session_state.upload_nonce += 1
+        st.rerun()
     source = st.radio("روش ورود", ["فایل CGM", "ورود دستی", "نمونه آموزشی"])
     if source == "فایل CGM":
-        upload = st.file_uploader("فایل Excel یا CSV", type=["xls", "xlsx", "csv"])
+        upload = st.file_uploader("فایل Excel یا CSV", type=["xls", "xlsx", "csv"], key=f"upload_{st.session_state.upload_nonce}")
     else:
         upload = None
     mode_label = st.selectbox("اولویت مدل", ["شناسایی بیشترین افت", "تعادل با کنترل برگشت", "هشدار محافظه‌کارانه"])
@@ -82,7 +105,7 @@ else:
         st.info("یک فایل CGM انتخاب کنید یا ورود دستی را فعال کنید.")
         st.stop()
     try:
-        frame = pd.read_csv(upload) if upload.name.lower().endswith(".csv") else pd.read_excel(upload)
+        frame = load_uploaded_file(upload.getvalue(), upload.name)
     except Exception as exc:
         st.error(f"فایل خوانده نشد: {exc}")
         st.stop()
@@ -106,9 +129,9 @@ with st.sidebar:
     unit = st.selectbox("واحد قند", ["mg/dL", "mmol/L"])
 
 try:
-    inputs = InputConfig(timezone=timezone, unit=unit)
+    analysis, row_metrics, events, event_metrics, metadata = run_analysis(
+        frame, time_col, glucose_col, timezone, unit, tuple(stream_columns), method)
     config = ModelConfig()
-    analysis, row_metrics, events, event_metrics, metadata = analyze(frame, time_col, glucose_col, inputs, config, stream_columns=stream_columns, method=method)
     state = latest_state(analysis, metadata, config)
 except Exception as exc:
     st.error(f"تحلیل انجام نشد: {exc}")
@@ -156,7 +179,12 @@ with tabs[1]:
     alerts_only = st.toggle("فقط ردیف‌های هشدار را نمایش بده")
     if alerts_only:
         display = display.loc[analysis["Alert_30m"].fillna(0).eq(1).to_numpy()]
-    st.dataframe(display, use_container_width=True, hide_index=True, height=560)
+    page_size = st.selectbox("تعداد ردیف در هر صفحه", [50, 100, 250], index=1)
+    total_pages = max(1, (len(display) + page_size - 1) // page_size)
+    page = st.number_input("شماره صفحه", min_value=1, max_value=total_pages, value=1, step=1)
+    start = (page - 1) * page_size
+    st.caption(f"نمایش ردیف‌های {start + 1:,} تا {min(start + page_size, len(display)):,} از {len(display):,}")
+    st.dataframe(display.iloc[start:start + page_size], use_container_width=True, hide_index=True, height=560)
 
 with tabs[2]:
     st.subheader("عملکرد مدل روی همین فایل")
