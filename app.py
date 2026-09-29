@@ -103,14 +103,14 @@ if state.get("row") is not None:
         alert=bool(row[f"Alert_{h}m"]==1); cls="danger" if alert else "good"; label="هشدار روند" if alert else "بدون هشدار"
         col.markdown(f'<div class="card {cls}"><h4>{h} دقیقه بعد</h4><h2>{row[f"Pred_Glucose_{h}m"]:.1f} <small>mg/dL</small></h2><p>{label}</p><p>مرز افت: ۷۰ mg/dL</p></div>',unsafe_allow_html=True)
 
-st.subheader("مدل چگونه به نتیجه می‌رسد؟")
-steps=[("۱. مرتب‌سازی","زمان‌ها پاک‌سازی و داده روی فاصله‌های منظم ۵ دقیقه‌ای قرار می‌گیرد."),("۲. کاهش نویز","میانگین‌گیری نمایی نوسان‌های لحظه‌ای سنسور را نرم می‌کند."),("۳. اندازه‌گیری روند","شیب، شتاب، فاصله تا ۷۰ و تداوم نزول محاسبه می‌شوند."),("۴. نگاه به آینده","روند فعلی برای ۳۰، ۴۵ و ۶۰ دقیقه برون‌یابی می‌شود."),("۵. جلوگیری از هشدار اشتباه","اگر قند در حال برگشت باشد، هشدار معمولی حذف می‌شود؛ افت سریع حفظ می‌شود."),("۶. یک افت = یک رویداد","هشدارهای پشت‌سرهم برای یک روند واحد به چند هشدار جدا تبدیل نمی‌شوند.")]
-for name,text in steps: st.markdown(f'<div class="step"><b>{name}</b><br>{text}</div>',unsafe_allow_html=True)
+with st.expander("چطور به این نتیجه رسیدیم؟", expanded=False):
+    steps=[("۱. مرتب‌سازی","زمان‌ها پاک‌سازی و داده روی فاصله‌های منظم ۵ دقیقه‌ای قرار می‌گیرد."),("۲. کاهش نویز","نوسان‌های لحظه‌ای سنسور نرم می‌شوند."),("۳. اندازه‌گیری روند","سرعت، شتاب، فاصله تا ۷۰ و تداوم نزول محاسبه می‌شوند."),("۴. نگاه به آینده","روند فعلی برای ۳۰، ۴۵ و ۶۰ دقیقه جلو برده می‌شود."),("۵. جلوگیری از هشدار اشتباه","اگر قند در حال برگشت باشد، هشدار معمولی حذف می‌شود؛ افت سریع حفظ می‌شود."),("۶. یک افت = یک رویداد","هشدارهای پشت‌سرهم برای یک روند واحد یکی حساب می‌شوند.")]
+    for name,text in steps: st.markdown(f'<div class="step"><b>{name}</b><br>{text}</div>',unsafe_allow_html=True)
 
 fig=go.Figure(); fig.add_scatter(x=analysis.index,y=analysis["Raw"],name="عدد خام سنسور",connectgaps=False); fig.add_scatter(x=analysis.index,y=analysis["Current_Glucose"],name="روند صاف‌شده",connectgaps=False); fig.add_hline(y=70,line_color="red",line_dash="dash",annotation_text="مرز افت ۷۰"); fig.update_layout(height=420,hovermode="x unified",xaxis_title="زمان",yaxis_title="mg/dL",legend_title="توضیح نمودار")
 st.plotly_chart(fig,use_container_width=True)
 
-with st.expander("جزئیات رویدادها و ارزیابی مدل"):
+with st.expander("جزئیات فنی و ارزیابی مدل (اختیاری)"):
     st.caption("این بخش برای بررسی فنی است. جدول‌های اصلی عمداً مخفی هستند تا استفاده روزمره ساده بماند.")
     st.write("خلاصه رویدادهای افت"); st.dataframe(event_summary,use_container_width=True,hide_index=True)
     st.write("ارزیابی خوانش‌ها"); st.dataframe(rows,use_container_width=True,hide_index=True)
