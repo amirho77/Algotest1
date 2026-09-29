@@ -100,7 +100,7 @@ if state.get("row") is not None:
     st.subheader("پیش‌بینی سه بازه زمانی")
     cols=st.columns(3)
     for col,h in zip(cols,HORIZONS):
-        alert=bool(row[f"Alert_{h}m"]==1); cls="danger" if alert else "good"; label="هشدار روند" if alert else "بدون هشدار"
+        alert=_is_true(row[f"Alert_{h}m"] == 1); cls="danger" if alert else "good"; label="هشدار روند" if alert else "بدون هشدار"
         col.markdown(f'<div class="card {cls}"><h4>{h} دقیقه بعد</h4><h2>{row[f"Pred_Glucose_{h}m"]:.1f} <small>mg/dL</small></h2><p>{label}</p><p>مرز افت: ۷۰ mg/dL</p></div>',unsafe_allow_html=True)
 
 with st.expander("چطور به این نتیجه رسیدیم؟", expanded=False):
@@ -117,12 +117,15 @@ def _trend(v):
     if v < -0.10: return "نزولی"
     if v > 0.10: return "صعودی"
     return "تقریباً ثابت"
+def _is_true(v):
+    return pd.notna(v) and bool(v)
 def _message(r):
-    if bool(r.get("Notification_30m", False)):
-        if bool(r.get("Fast_Drop_Risk", False)): return "افت سریع دیده شد؛ روند قند را فوراً بررسی کنید."
-        if bool(r.get("Preventive_Alert", False)): return "روند نزولی پایدار است؛ قند را زودتر بررسی کنید."
+    if _is_true(r.get("Notification_30m", False)):
+        if _is_true(r.get("Fast_Drop_Risk", False)): return "افت سریع دیده شد؛ روند قند را فوراً بررسی کنید."
+        if _is_true(r.get("Preventive_Alert", False)): return "روند نزولی پایدار است؛ قند را زودتر بررسی کنید."
         return "ادامه روند فعلی می‌تواند به افت قند منجر شود؛ روند را بررسی کنید."
-    if bool(r.get("Alert_30m", 0) == 1): return "روند نیازمند پایش است؛ هنوز اعلان اصلی ارسال نشده است."
+    alert = r.get("Alert_30m", 0)
+    if pd.notna(alert) and alert == 1: return "روند نیازمند پایش است؛ هنوز اعلان اصلی ارسال نشده است."
     return "اعلان فعالی نیست."
 view = analysis.copy()
 table = pd.DataFrame({
