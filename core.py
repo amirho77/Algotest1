@@ -8,7 +8,7 @@ from model import predict, latest_state
 from evaluation import evaluate, evaluate_events
 
 
-def analyze(frame, time_col, glucose_col, input_config=None, model_config=None, *, as_of=None, stream_columns=(), method="recovery"):
+def analyze(frame, time_col, glucose_col, input_config=None, model_config=None, *, as_of=None, stream_columns=(), method="enhanced"):
     cfg=model_config or ModelConfig()
     grid, metadata=prepare(frame,time_col,glucose_col,input_config,as_of=as_of,stream_columns=stream_columns)
     predictions=predict(grid,cfg,method=method)
@@ -16,7 +16,7 @@ def analyze(frame, time_col, glucose_col, input_config=None, model_config=None, 
     events, event_summary=evaluate_events(analysis,cfg)
     metadata.update({"version":VERSION,"method":method,"model_config":cfg.to_dict(),
                      "scenario_band":"Uncalibrated model spread; NOT a confidence interval or probability",
-                     "v3_alert":"Recovery-filtered Enhanced is the product default; raw Enhanced remains available for sensitivity analysis"})
+                     "v3_alert":"Enhanced is the product default because the current product priority is maximum event capture; recovery remains available as a false-alarm control"})
     return analysis, rows, events, event_summary, metadata
 
 
@@ -24,7 +24,7 @@ def predict_latest(frame,time_col,glucose_col,*,as_of,input_config=None,model_co
     """as_of is mandatory. Future rows and unfinished bins cannot enter a forecast."""
     cfg=model_config or ModelConfig()
     grid,metadata=prepare(frame,time_col,glucose_col,input_config,as_of=as_of,stream_columns=stream_columns)
-    predictions=predict(grid,cfg,method="recovery")
+    predictions=predict(grid,cfg,method="enhanced")
     return latest_state(predictions,metadata,cfg), metadata
 
 

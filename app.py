@@ -18,7 +18,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="hero"><h1>🩸 پایش روند قند و هشدار افت</h1><p>این صفحه به زبان ساده نشان می‌دهد روند قند بیمار به کدام سمت می‌رود و آیا در ۳۰، ۴۵ یا ۶۰ دقیقه آینده احتمال رسیدن به محدوده افت وجود دارد.</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>🩸 پلتفرم پایش و پیش‌بینی افت قند</h1><p>این صفحه روند قند را بررسی می‌کند و نشان می‌دهد آیا در ۱۰، ۱۵، ۲۰، ۲۵ یا ۳۰ دقیقه آینده به محدوده افت نزدیک می‌شود.</p></div>', unsafe_allow_html=True)
 st.caption(f"نسخه MVP پژوهشی {VERSION} | مدل پیش‌فرض: Recovery")
 st.warning("این ابزار برای اطلاع‌رسانی روند است؛ درمان، دوز انسولین یا تصمیم پزشکی پیشنهاد نمی‌کند و جایگزین هشدار دستگاه نیست.")
 
@@ -27,8 +27,8 @@ with st.sidebar:
     source = st.radio("روش ورود داده", ["فایل CGM", "ورود دستی", "نمونه آموزشی"], index=0)
     demo = source == "نمونه آموزشی"
     upload = st.file_uploader("فایل داده CGM را انتخاب کنید", type=["csv", "xlsx", "xls"]) if source == "فایل CGM" else None
-    method_label = st.selectbox("نوع بررسی", ["پیشنهاد MVP (متعادل)", "حساسیت بیشتر", "هشدارهای محافظه‌کارانه"])
-    method = {"پیشنهاد MVP (متعادل)":"recovery", "حساسیت بیشتر":"enhanced", "هشدارهای محافظه‌کارانه":"precision"}[method_label]
+    method_label = st.selectbox("نوع بررسی", ["حساسیت بیشتر (پیشنهاد جلسه)", "متعادل با کنترل برگشت", "هشدارهای محافظه‌کارانه"])
+    method = {"حساسیت بیشتر (پیشنهاد جلسه)":"enhanced", "متعادل با کنترل برگشت":"recovery", "هشدارهای محافظه‌کارانه":"precision"}[method_label]
 
 if source == "ورود دستی":
     st.subheader("ورود دستی سری زمانی")
@@ -108,7 +108,7 @@ if state.get("row") is not None:
         col.markdown(f'<div class="card {cls}"><h4>{h} دقیقه بعد</h4><h2>{row[f"Pred_Glucose_{h}m"]:.1f} <small>mg/dL</small></h2><p>{label}</p><p>مرز افت: ۷۰ mg/dL</p></div>',unsafe_allow_html=True)
 
 with st.expander("چطور به این نتیجه رسیدیم؟", expanded=False):
-    steps=[("۱. مرتب‌سازی","زمان‌ها پاک‌سازی و داده روی فاصله‌های منظم ۵ دقیقه‌ای قرار می‌گیرد."),("۲. کاهش نویز","نوسان‌های لحظه‌ای سنسور نرم می‌شوند."),("۳. اندازه‌گیری روند","سرعت، شتاب، فاصله تا ۷۰ و تداوم نزول محاسبه می‌شوند."),("۴. نگاه به آینده","روند فعلی برای ۳۰، ۴۵ و ۶۰ دقیقه جلو برده می‌شود."),("۵. جلوگیری از هشدار اشتباه","اگر قند در حال برگشت باشد، هشدار معمولی حذف می‌شود؛ افت سریع حفظ می‌شود."),("۶. یک افت = یک رویداد","هشدارهای پشت‌سرهم برای یک روند واحد یکی حساب می‌شوند.")]
+    steps=[("۱. مرتب‌سازی","زمان‌ها پاک‌سازی و داده روی فاصله‌های منظم ۵ دقیقه‌ای قرار می‌گیرد."),("۲. کاهش نویز","نوسان‌های لحظه‌ای سنسور نرم می‌شوند."),("۳. اندازه‌گیری روند","سرعت، شتاب، فاصله تا ۷۰ و تداوم نزول محاسبه می‌شوند."),("۴. نگاه به آینده","روند فعلی برای افق‌های ۱۰ تا ۳۰ دقیقه جلو برده می‌شود."),("۵. اولویت جلسه","مدل پیش‌فرض حساسیت را بیشتر می‌کند تا افت‌های واقعی کمتری از دست بروند."),("۶. یک افت = یک رویداد","هشدارهای پشت‌سرهم برای یک روند واحد یکی حساب می‌شوند.")]
     for name,text in steps: st.markdown(f'<div class="step"><b>{name}</b><br>{text}</div>',unsafe_allow_html=True)
 
 fig=go.Figure(); fig.add_scatter(x=analysis.index,y=analysis["Raw"],name="عدد خام سنسور",connectgaps=False); fig.add_scatter(x=analysis.index,y=analysis["Current_Glucose"],name="روند صاف‌شده",connectgaps=False); fig.add_hline(y=70,line_color="red",line_dash="dash",annotation_text="مرز افت ۷۰"); fig.update_layout(height=420,hovermode="x unified",xaxis_title="زمان",yaxis_title="mg/dL",legend_title="توضیح نمودار")
@@ -136,10 +136,8 @@ table = pd.DataFrame({
     "قند هموارشده": view["Current_Glucose"].round(1),
     "روند ۱۵ دقیقه": view["ROC_15m"].map(_trend),
     "شیب (واحد/دقیقه)": view["ROC_15m"].round(2),
-    "پیش‌بینی ۳۰ دقیقه": view["Pred_Glucose_30m"].round(1),
-    "پیش‌بینی ۴۵ دقیقه": view["Pred_Glucose_45m"].round(1),
-    "پیش‌بینی ۶۰ دقیقه": view["Pred_Glucose_60m"].round(1),
-    "هشدار ۳۰ دقیقه": view["Alert_30m"].map({1:"بله",0:"خیر"}),
+    **{f"پیش‌بینی {h} دقیقه": view[f"Pred_Glucose_{h}m"].round(1) for h in HORIZONS},
+    "هشدار نزدیک‌ترین افق": view[f"Alert_{HORIZONS[0]}m"].map({1:"بله",0:"خیر"}),
     "پیام کاربر": [_message(view.iloc[i]) for i in range(len(view))],
 }, index=view.index)
 st.dataframe(table, use_container_width=True, hide_index=True)

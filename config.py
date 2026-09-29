@@ -2,7 +2,7 @@
 from dataclasses import dataclass, asdict
 import math
 
-HORIZONS = (30, 45, 60)
+HORIZONS = (10, 15, 20, 25, 30)
 VERSION = "3.3.0-enhanced-precision-guard"
 
 
