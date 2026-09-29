@@ -89,6 +89,10 @@ status_map={"current_low":("danger","قند فعلی پایین است","آخر�
 kind,title,desc=status_map.get(state["status"],("neutral",state["status"],""))
 st.markdown(f'<div class="card {kind}"><h3>{title}</h3><p>{desc}</p><p class="small">آخرین زمان داده: {metadata["latest_input_UTC"]} (UTC)</p></div>', unsafe_allow_html=True)
 
+def _is_true(v):
+    """Safe boolean conversion for pandas values, including pd.NA."""
+    return pd.notna(v) and bool(v)
+
 if state.get("row") is not None:
     row=state["row"]
     st.subheader("خلاصه قابل فهم از وضعیت")
@@ -117,8 +121,6 @@ def _trend(v):
     if v < -0.10: return "نزولی"
     if v > 0.10: return "صعودی"
     return "تقریباً ثابت"
-def _is_true(v):
-    return pd.notna(v) and bool(v)
 def _message(r):
     if _is_true(r.get("Notification_30m", False)):
         if _is_true(r.get("Fast_Drop_Risk", False)): return "افت سریع دیده شد؛ روند قند را فوراً بررسی کنید."
