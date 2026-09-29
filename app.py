@@ -150,17 +150,19 @@ if source == "ورود دستی":
 else:
     r30 = rows.loc[rows["Horizon_min"].eq(30)].iloc[0]
     e30 = event_summary.loc[event_summary["Horizon_min"].eq(30)].iloc[0]
+    actual_events = int(e30["All_events"])
     captured = int(e30["Captured"]); eligible = int(e30["Eligible_events"]); missed = int(e30["Missed_eligible"] + e30["No_opportunity"])
     false_alerts = int(r30["Notification_FP"])
     precision = float(r30["Precision"]) if pd.notna(r30["Precision"]) else 0.0
     recall = float(e30["Recall_eligible_events"]) if pd.notna(e30["Recall_eligible_events"]) else 0.0
     score = max(0, min(100, round(100 * (0.55 * recall + 0.35 * precision + 0.10 * max(0, 1 - false_alerts / max(1, int(r30["Notification_TP"] + false_alerts)))))))
-    m1,m2,m3,m4,m5=st.columns(5)
-    m1.metric("افت واقعی شناسایی‌شده", captured)
-    m2.metric("افت قابل تشخیص از دست‌رفته", missed)
-    m3.metric("هشدار کاذب", false_alerts)
-    m4.metric("دقت هشدار", f"{precision*100:.1f}%")
-    m5.metric("امتیاز این فایل", f"{score}/100")
+    m1,m2,m3,m4,m5,m6=st.columns(6)
+    m1.metric("کل افت‌های واقعی فایل", actual_events, help="تعداد رویدادهایی که کمترین قند آینده آن‌ها به ۷۰ یا کمتر رسیده است.")
+    m2.metric("افت شناسایی‌شده", captured)
+    m3.metric("افت شناسایی‌نشده", missed)
+    m4.metric("هشدار کاذب", false_alerts)
+    m5.metric("دقت هشدار", f"{precision*100:.1f}%")
+    m6.metric("امتیاز این فایل", f"{score}/100")
     notes=[]
     if recall < .80: notes.append("بخشی از افت‌های واقعی قبل از هشدار از دست رفته‌اند؛ حساسیت باید بررسی شود.")
     if precision < .50: notes.append("هشدار کاذب زیاد است؛ برگشت قند و روندهای ناپایدار علت محتمل هستند.")
