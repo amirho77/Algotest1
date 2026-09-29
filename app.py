@@ -47,15 +47,14 @@ def trend_label(roc):
     return "تقریباً ثابت"
 
 
-@st.cache_data(show_spinner=False)
 def load_uploaded_file(content, filename):
-    """Avoid repeated Excel parsing on every Streamlit interaction."""
+    """Read one uploaded file without retaining copies in Cloud cache."""
     buffer = io.BytesIO(content)
     return pd.read_csv(buffer) if filename.lower().endswith(".csv") else pd.read_excel(buffer)
 
 
-@st.cache_data(show_spinner="در حال تحلیل فایل…")
 def run_analysis(frame, time_column, glucose_column, timezone_name, unit_name, stream_column_names, model_method):
+    """Run once per interaction; caching full dataframes can exhaust Cloud memory."""
     inputs = InputConfig(timezone=timezone_name, unit=unit_name)
     config = ModelConfig()
     return analyze(frame, time_column, glucose_column, inputs, config,
@@ -129,8 +128,9 @@ with st.sidebar:
     unit = st.selectbox("واحد قند", ["mg/dL", "mmol/L"])
 
 try:
-    analysis, row_metrics, events, event_metrics, metadata = run_analysis(
-        frame, time_col, glucose_col, timezone, unit, tuple(stream_columns), method)
+    with st.spinner("در حال پردازش فایل و ساخت گزارش…"):
+        analysis, row_metrics, events, event_metrics, metadata = run_analysis(
+            frame, time_col, glucose_col, timezone, unit, tuple(stream_columns), method)
     config = ModelConfig()
     state = latest_state(analysis, metadata, config)
 except Exception as exc:
