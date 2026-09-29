@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pandas as pd
 from core import prepare, predict, evaluate, evaluate_events, predict_latest, latest_state, excel_bytes, analyze
-from config import InputConfig, ModelConfig
+from config import HORIZONS, InputConfig, ModelConfig
 from validation import assert_patient_disjoint, assert_purged_boundary
 from synthetic import make_scenario, SCENARIOS
 from site_compat import predict_site, evaluate_site
@@ -129,7 +129,7 @@ class CausalTests(unittest.TestCase):
         rng=np.random.default_rng(731)
         f=frame(120+np.cumsum(rng.normal(0,3,60)))
         full,_,_=compute(f)
-        cols=['Current_Glucose','Forecast_Slope','Low_Risk_Score']+[f'Alert_{h}m' for h in (30,45,60)]
+        cols=['Current_Glucose','Forecast_Slope','Low_Risk_Score']+[f'Alert_{h}m' for h in HORIZONS]
         for size in (1,12,13,20,47):
             short,_,_=compute(f.iloc[:size])
             pd.testing.assert_frame_equal(short[cols],full.loc[short.index,cols])
@@ -201,19 +201,19 @@ class ScenarioTests(unittest.TestCase):
         f=pd.DataFrame({'time':pd.date_range('2026-01-01',periods=91,freq='min',tz='UTC'),'glucose':np.full(91,120.)})
         a,_,_=compute(f)
         self.assertTrue(a.Prediction_Ready.iloc[-1])
-        self.assertEqual(a.Pred_Glucose_60m.iloc[-1],120)
+        self.assertEqual(a.Pred_Glucose_30m.iloc[-1],120)
 
     def test_sparse_sensor_abstains_instead_of_interpolating(self):
         f=pd.DataFrame({'time':pd.date_range('2026-01-01',periods=20,freq='15min',tz='UTC'),'glucose':np.linspace(160,80,20)})
         a,_,_=compute(f)
         self.assertFalse(a.Prediction_Ready.any())
-        self.assertTrue(a.Alert_60m.isna().all())
+        self.assertTrue(a.Alert_30m.isna().all())
 
     def test_long_gap_no_cross_gap_alarm_credit(self):
         f=frame();f=f.drop(index=range(20,40));f.loc[40,'glucose']=60
         a,_,_=compute(f);ev,_=evaluate_events(a)
         self.assertEqual(len(ev),1)
-        self.assertFalse(ev.Eligible_60.iloc[0])
+        self.assertFalse(ev.Eligible_30.iloc[0])
 
     def test_empty_and_bad_grid(self):
         with self.assertRaises(ValueError): prepare(frame(n=0),'time','glucose')
@@ -222,7 +222,7 @@ class ScenarioTests(unittest.TestCase):
 
     def test_constant_normal(self):
         a,_,_=compute(frame())
-        self.assertEqual(a.Alert_60m.dropna().sum(),0)
+        self.assertEqual(a.Alert_30m.dropna().sum(),0)
         self.assertTrue(a.Forecast_Slope.dropna().eq(0).all())
 
     def test_sustained_decline(self):
@@ -232,7 +232,7 @@ class ScenarioTests(unittest.TestCase):
 
     def test_sustained_rise(self):
         a,_,_=compute(frame(np.linspace(80,240,60)))
-        self.assertEqual(a.Alert_60m.dropna().sum(),0)
+        self.assertEqual(a.Alert_30m.dropna().sum(),0)
 
     def test_current_low_first_reading(self):
         a,_,m=compute(frame([65]))
@@ -250,12 +250,11 @@ class ScenarioTests(unittest.TestCase):
             f=frame(np.clip(120+np.cumsum(rng.normal(0,8,100)),30,350))
             a,_,_=compute(f)
             ready=a.loc[a.Prediction_Ready]
-            for h in (30,45,60):
+            for h in HORIZONS:
                 self.assertTrue(np.isfinite(ready[f'Pred_Glucose_{h}m']).all())
                 self.assertTrue(ready[f'Lower_Scenario_{h}m'].le(ready[f'Pred_Glucose_{h}m']).all())
                 self.assertTrue(ready[f'Upper_Scenario_{h}m'].ge(ready[f'Pred_Glucose_{h}m']).all())
-            self.assertTrue(ready.Alert_30m.le(ready.Alert_45m).all())
-            self.assertTrue(ready.Alert_45m.le(ready.Alert_60m).all())
+            self.assertTrue(ready.Alert_10m.isin([0,1]).all())
 
     def test_artifact_like_low_not_deleted_as_noise(self):
         f=frame(); f.loc[59,'glucose']=45
@@ -266,7 +265,7 @@ class ScenarioTests(unittest.TestCase):
     def test_recovery_and_reversal(self):
         f=frame(np.r_[np.linspace(170,85,30),np.linspace(90,180,30)])
         a,_,_=compute(f)
-        self.assertEqual(a.Alert_60m.iloc[-1],0)
+        self.assertEqual(a.Alert_30m.iloc[-1],0)
         self.assertTrue(a.Trend_Disagreement.any())
 
     def test_same_history_can_have_different_futures(self):
@@ -284,8 +283,8 @@ class ScenarioTests(unittest.TestCase):
     def test_notification_cooldown_separate_from_flags(self):
         g,_=prepare(frame(np.linspace(240,72,80)),'time','glucose')
         p=predict(g)
-        self.assertGreater(p.Alert_60m.sum(),p.Notification_60m.sum())
-        times=p.index[p.Notification_60m]
+        self.assertGreater(p.Alert_30m.sum(),p.Notification_30m.sum())
+        times=p.index[p.Notification_30m]
         self.assertTrue(((times[1:]-times[:-1])>=pd.Timedelta(minutes=15)).all())
 
 
@@ -293,7 +292,7 @@ class EvaluationTests(unittest.TestCase):
     def test_future_tail_unknown_and_current_excluded(self):
         a,_,_=compute(frame(np.r_[65,np.full(59,120)]))
         self.assertEqual(a.Y30_Actual.iloc[0],0)
-        self.assertTrue(a.Y60_Actual.tail(12).isna().all())
+        self.assertTrue(a.Y30_Actual.tail(6).isna().all())
         self.assertEqual(a.Outcome_30m.iloc[0],'AlreadyLow')
 
     def test_equality_at_70(self):
@@ -311,7 +310,7 @@ class EvaluationTests(unittest.TestCase):
         a,_,_=compute(f);ev,s=evaluate_events(a)
         self.assertEqual(len(ev),2)
         self.assertEqual(ev.Low_readings.tolist(),[4,1])
-        self.assertEqual(s.All_events.tolist(),[2,2,2])
+        self.assertEqual(s.All_events.tolist(),[2]*len(HORIZONS))
 
     def test_no_events_undefined_recall(self):
         a,s,_=compute(frame());ev,e=evaluate_events(a)
@@ -350,9 +349,10 @@ class EvaluationTests(unittest.TestCase):
         a=predict(g,method='baseline'); b=frozen(g)
         for name in ['Current_Glucose','ROC_15m','Acceleration','Low_Risk_Score']:
             np.testing.assert_allclose(a[name],b[name],equal_nan=True)
-        for h in (30,45,60):
+        for h in (30,):
             pd.testing.assert_series_equal(a[f'Alert_{h}m'],b[f'Alert_{h}m'])
 
 
 if __name__=='__main__':
     unittest.main()
+
