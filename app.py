@@ -1,190 +1,203 @@
+"""CGM hypoglycaemia MVP dashboard: user-facing Streamlit surface."""
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
 from config import HORIZONS, InputConfig, ModelConfig, VERSION
 from core import analyze, excel_bytes, latest_state
 
-st.set_page_config(page_title="CGM | پایش افت قند", page_icon="🩸", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="CGM Hypo", page_icon="🩸", layout="wide", initial_sidebar_state="expanded")
 st.markdown("""
 <style>
-.block-container {max-width: 1380px; padding-top: 1.6rem;}
-.hero {padding: 1.2rem 1.4rem; border-radius: 16px; background: linear-gradient(120deg,#ecfeff,#f8fafc); border:1px solid #cbd5e1; margin-bottom:1rem;}
-.card {padding: 1rem; border-radius: 14px; border:1px solid #e2e8f0; background:#fff; min-height:150px;}
-.card h4 {margin:0 0 .4rem 0; color:#0f172a;}
-.card p {margin:.25rem 0; color:#475569; font-size:.92rem;}
-.good {border-top:5px solid #16a34a;} .warn {border-top:5px solid #f59e0b;} .danger {border-top:5px solid #dc2626;} .neutral {border-top:5px solid #64748b;}
-.step {padding:.65rem .8rem; border-radius:9px; background:#f8fafc; border:1px solid #e2e8f0; margin:.35rem 0;}
-.small {font-size:.86rem; color:#64748b;}
+  .block-container{max-width:1320px;padding-top:1.25rem}
+  [data-testid="stMetric"]{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px}
+  .topbar{padding:18px 22px;background:linear-gradient(110deg,#0f766e,#115e59);border-radius:16px;color:#fff;margin-bottom:18px}
+  .topbar h1{margin:0;font-size:1.7rem}.topbar p{margin:6px 0 0;opacity:.9}
+  .status{padding:14px 16px;border-radius:12px;margin:12px 0 18px}.status.good{background:#f0fdf4;border:1px solid #86efac}.status.warn{background:#fffbeb;border:1px solid #fcd34d}.status.danger{background:#fef2f2;border:1px solid #fca5a5}.status.neutral{background:#f8fafc;border:1px solid #cbd5e1}
+  .horizon{border:1px solid #e5e7eb;border-top:4px solid #0f766e;border-radius:12px;padding:14px;background:#fff}.horizon.alert{border-top-color:#dc2626;background:#fffafa}
+  .muted{color:#64748b;font-size:.9rem}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="hero"><h1>🩸 پلتفرم پایش و پیش‌بینی افت قند</h1><p>این صفحه روند قند را بررسی می‌کند و نشان می‌دهد آیا در ۱۰، ۱۵، ۲۰، ۲۵ یا ۳۰ دقیقه آینده به محدوده افت نزدیک می‌شود.</p></div>', unsafe_allow_html=True)
-st.caption(f"نسخه MVP پژوهشی {VERSION} | مدل پیش‌فرض: Recovery")
-st.warning("این ابزار برای اطلاع‌رسانی روند است؛ درمان، دوز انسولین یا تصمیم پزشکی پیشنهاد نمی‌کند و جایگزین هشدار دستگاه نیست.")
+
+def is_true(value):
+    return pd.notna(value) and bool(value)
+
+
+def plain_message(row):
+    if is_true(row.get("Notification_30m", False)):
+        if is_true(row.get("Fast_Drop_Risk", False)):
+            return "افت سریع دیده شده است؛ روند قند را بررسی کنید."
+        if is_true(row.get("Preventive_Alert", False)):
+            return "روند نزولی پایدار است؛ قند را زودتر بررسی کنید."
+        return "ادامه روند فعلی ممکن است به افت قند منجر شود؛ روند را بررسی کنید."
+    if is_true(row.get("Alert_30m", False)):
+        return "روند نیازمند پایش است؛ اعلان اصلی هنوز ارسال نشده است."
+    return "اعلان فعالی نیست."
+
+
+def trend_label(roc):
+    if pd.isna(roc):
+        return "داده کافی نیست"
+    if roc < -0.10:
+        return "نزولی"
+    if roc > 0.10:
+        return "صعودی"
+    return "تقریباً ثابت"
+
+
+st.markdown("""<div class="topbar"><h1>پلتفرم پایش افت قند</h1><p>روند قند را بخوانید، هشدارهای مدل را ببینید و عملکرد همان فایل را ارزیابی کنید.</p></div>""", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.header("۱) ورود داده")
-    source = st.radio("روش ورود داده", ["فایل CGM", "ورود دستی", "نمونه آموزشی"], index=0)
-    demo = source == "نمونه آموزشی"
-    upload = st.file_uploader("فایل داده CGM را انتخاب کنید", type=["csv", "xlsx", "xls"]) if source == "فایل CGM" else None
-    method_label = st.selectbox("نوع بررسی", ["حساسیت بیشتر (پیشنهاد جلسه)", "متعادل با کنترل برگشت", "هشدارهای محافظه‌کارانه"])
-    method = {"حساسیت بیشتر (پیشنهاد جلسه)":"enhanced", "متعادل با کنترل برگشت":"recovery", "هشدارهای محافظه‌کارانه":"precision"}[method_label]
+    st.header("ورود داده")
+    source = st.radio("روش ورود", ["فایل CGM", "ورود دستی", "نمونه آموزشی"])
+    if source == "فایل CGM":
+        upload = st.file_uploader("فایل Excel یا CSV", type=["xls", "xlsx", "csv"])
+    else:
+        upload = None
+    mode_label = st.selectbox("اولویت مدل", ["شناسایی بیشترین افت", "تعادل با کنترل برگشت", "هشدار محافظه‌کارانه"])
+    method = {"شناسایی بیشترین افت":"enhanced", "تعادل با کنترل برگشت":"recovery", "هشدار محافظه‌کارانه":"precision"}[mode_label]
+    st.caption("حالت اول برای اولویت فعلی پروژه انتخاب شده است.")
 
-if source == "ورود دستی":
-    st.subheader("ورود دستی سری زمانی")
-    st.caption("هر ردیف یک خوانش است؛ فاصله زمانی خوانش‌ها به‌صورت خودکار ۵ دقیقه در نظر گرفته می‌شود.")
-    n_manual = st.number_input("تعداد خوانش‌ها", min_value=12, max_value=288, value=24, step=1)
-    manual = pd.DataFrame({"شماره خوانش": range(1, int(n_manual) + 1), "قند (mg/dL)": [140.0] * int(n_manual)})
-    manual = st.data_editor(manual, num_rows="fixed", use_container_width=True, hide_index=True,
-                            column_config={"شماره خوانش": st.column_config.NumberColumn("خوانش", disabled=True),
-                                           "قند (mg/dL)": st.column_config.NumberColumn("قند (mg/dL)", min_value=20, max_value=400, step=1, format="%.0f")})
-    values = pd.to_numeric(manual["قند (mg/dL)"], errors="coerce")
-    if values.isna().any(): st.error("همه ردیف‌ها باید عدد قند داشته باشند."); st.stop()
-    end = pd.Timestamp.now(tz="UTC").floor("5min")
-    frame = pd.DataFrame({"زمان": pd.date_range(end - pd.Timedelta(minutes=5 * (len(values)-1)), end, freq="5min"), "قند": values.to_numpy()})
-    time_col, glucose_col, ids, original_count = "زمان", "قند", [], len(values)
-elif demo:
-    frame = pd.DataFrame({"زمان":pd.date_range("2026-01-01", periods=60, freq="5min", tz="UTC"), "قند": [180-i*1.7 for i in range(60)]})
-    st.info("این فقط نمونه آموزشی است و برای تصمیم درباره بیمار استفاده نمی‌شود.")
-elif upload:
-    if upload.size > 50_000_000: st.error("حجم فایل بیشتر از ۵۰ مگابایت است."); st.stop()
-    try: frame = pd.read_csv(upload) if upload.name.lower().endswith(".csv") else pd.read_excel(upload)
-    except Exception as exc: st.error(f"فایل خوانده نشد: {exc}"); st.stop()
+manual_mode = source == "ورود دستی"
+if manual_mode:
+    st.subheader("ورود دستی خوانش‌ها")
+    st.caption("هر ردیف یک خوانش است. سیستم بین همه ردیف‌ها ۵ دقیقه فاصله می‌گذارد.")
+    count = st.number_input("تعداد خوانش", 12, 288, 24, 1)
+    entered = pd.DataFrame({"ردیف": range(1, int(count) + 1), "قند mg/dL": [140.0] * int(count)})
+    entered = st.data_editor(entered, hide_index=True, num_rows="fixed", use_container_width=True,
+        column_config={"ردیف": st.column_config.NumberColumn(disabled=True), "قند mg/dL": st.column_config.NumberColumn(min_value=20, max_value=400, step=1)})
+    glucose = pd.to_numeric(entered["قند mg/dL"], errors="coerce")
+    if glucose.isna().any():
+        st.error("همه ردیف‌ها باید مقدار عددی قند داشته باشند.")
+        st.stop()
+    last_time = pd.Timestamp.now(tz="UTC").floor("5min")
+    frame = pd.DataFrame({"time": pd.date_range(last_time - pd.Timedelta(minutes=5 * (len(glucose)-1)), last_time, freq="5min"), "glucose": glucose})
+    time_col, glucose_col, stream_columns, original_count = "time", "glucose", [], len(frame)
+elif source == "نمونه آموزشی":
+    frame = pd.DataFrame({"time": pd.date_range("2026-01-01", periods=48, freq="5min", tz="UTC"), "glucose": list(range(160, 112, -1))})
+    time_col, glucose_col, stream_columns, original_count = "time", "glucose", [], len(frame)
 else:
-    st.info("از نوار کناری یک فایل CGM انتخاب کنید تا تحلیل شروع شود."); st.stop()
+    if upload is None:
+        st.info("یک فایل CGM انتخاب کنید یا ورود دستی را فعال کنید.")
+        st.stop()
+    try:
+        frame = pd.read_csv(upload) if upload.name.lower().endswith(".csv") else pd.read_excel(upload)
+    except Exception as exc:
+        st.error(f"فایل خوانده نشد: {exc}")
+        st.stop()
+    if frame.empty or len(frame.columns) < 2:
+        st.error("فایل باید حداقل ستون زمان و ستون قند داشته باشد.")
+        st.stop()
+    original_count = len(frame)
+    with st.sidebar:
+        st.header("معرفی ستون‌ها")
+        time_col = st.selectbox("ستون زمان", frame.columns)
+        glucose_col = st.selectbox("ستون قند", frame.columns, index=1)
+        candidates = [c for c in frame.columns if c not in (time_col, glucose_col)]
+        stream_columns = st.multiselect("شناسه بیمار یا سنسور (در صورت وجود)", candidates)
+        if not stream_columns and not st.checkbox("فایل فقط یک بیمار و یک سنسور دارد"):
+            st.info("برای جلوگیری از ترکیب تاریخچه‌ها، تک‌جریانی بودن فایل را تأیید کنید.")
+            st.stop()
 
-if frame.empty or len(frame.columns)<2: st.error("فایل باید حداقل دو ستون داشته باشد."); st.stop()
 with st.sidebar:
-    st.header("۲) معرفی ستون‌ها")
-    if source != "ورود دستی":
-        time_col = st.selectbox("کدام ستون زمان است؟", frame.columns)
-        glucose_col = st.selectbox("کدام ستون عدد قند است؟", frame.columns, index=1)
-    other = [c for c in frame.columns if c not in (time_col, glucose_col)]
-    known = [c for c in other if str(c).lower() in ("patient_id","subject_id","sensor_id","session_id")]
-    ids = st.multiselect("شناسه بیمار یا سنسور (اختیاری)", other, default=known)
-    original_count=len(frame)
-    for column in ids:
-        values=frame[column].dropna().unique().tolist()
-        if not values: st.error(f"ستون {column} شناسه معتبر ندارد."); st.stop()
-        selected=st.selectbox(f"انتخاب {column}", values); frame=frame.loc[frame[column].eq(selected)]
-    if not ids and not demo and source != "ورود دستی":
-        st.checkbox("فایل فقط مربوط به یک بیمار/سنسور است", key="single_stream")
-    unit=st.selectbox("واحد عدد قند", ["mg/dL","mmol/L"])
-    timezone=st.text_input("منطقه زمانی داده", "Asia/Tehran")
-    with st.expander("تنظیمات پیشرفته ورود داده"):
-        date_format=st.text_input("قالب تاریخ (در صورت نیاز)", "")
-        numeric_time=st.selectbox("واحد زمان عددی", ["غیرفعال","excel","s","ms"])
-        use_bounds=st.checkbox("حد پایین/بالای سنسور مشخص است")
-        lower=st.number_input("حد پایین mg/dL", min_value=1., value=40.) if use_bounds else None
-        upper=st.number_input("حد بالا mg/dL", min_value=2., value=400.) if use_bounds else None
-if not ids and not demo and source != "ورود دستی" and not st.session_state.get("single_stream",False):
-    st.info("برای جلوگیری از ترکیب داده چند نفر، تک‌جریانی بودن فایل را تأیید کنید یا شناسه انتخاب کنید."); st.stop()
+    st.header("تنظیمات")
+    timezone = st.text_input("منطقه زمانی", "Asia/Tehran")
+    unit = st.selectbox("واحد قند", ["mg/dL", "mmol/L"])
 
 try:
-    inputs=InputConfig(timezone=timezone,unit=unit,date_format=date_format or None,numeric_time_unit=None if numeric_time=="غیرفعال" else numeric_time,sensor_lower=lower,sensor_upper=upper)
-    cfg=ModelConfig(); analysis,rows,events,event_summary,metadata=analyze(frame,time_col,glucose_col,inputs,cfg,stream_columns=ids,method=method); state=latest_state(analysis,metadata,cfg)
-except Exception as exc: st.error(f"تحلیل انجام نشد: {exc}"); st.stop()
+    inputs = InputConfig(timezone=timezone, unit=unit)
+    config = ModelConfig()
+    analysis, row_metrics, events, event_metrics, metadata = analyze(frame, time_col, glucose_col, inputs, config, stream_columns=stream_columns, method=method)
+    state = latest_state(analysis, metadata, config)
+except Exception as exc:
+    st.error(f"تحلیل انجام نشد: {exc}")
+    st.stop()
 
-status_map={"current_low":("danger","قند فعلی پایین است","آخرین عدد ثبت‌شده در محدوده افت قرار دارد."),"predicted_low":("danger","احتمال افت در روند دیده می‌شود","روند فعلی در یکی از افق‌های زمانی به محدوده افت می‌رسد."),"preventive_risk":("warn","روند نزولی نیازمند توجه است","هنوز الزاماً افت رخ نداده، اما جهت حرکت قند هشداردهنده است."),"uncertain_trend":("warn","روند نامطمئن است","داده‌ها جهت یکسانی ندارند؛ بررسی خوانش بعدی مهم است."),"stale":("neutral","داده قدیمی است","برای وضعیت فعلی داده تازه کافی نیست."),"sensor_check":("neutral","خوانش سنسور قابل اتکا نیست","آخرین خوانش عدد معتبر ندارد."),"insufficient_data":("neutral","سابقه کافی نیست","برای پیش‌بینی به داده پیوسته بیشتری نیاز است."),"short_history":("neutral","سابقه کوتاه است","فعلاً فقط روند کوتاه‌مدت بررسی شده است."),"no_model_alert":("good","هشدار فعالی دیده نشد","در داده فعلی نشانه کافی برای هشدار وجود ندارد.")}
-kind,title,desc=status_map.get(state["status"],("neutral",state["status"],""))
-st.markdown(f'<div class="card {kind}"><h3>{title}</h3><p>{desc}</p><p class="small">آخرین زمان داده: {metadata["latest_input_UTC"]} (UTC)</p></div>', unsafe_allow_html=True)
+tabs = st.tabs(["داشبورد", "جدول پیش‌بینی", "ارزیابی فایل", "روش محاسبه"])
 
-def _is_true(v):
-    """Safe boolean conversion for pandas values, including pd.NA."""
-    return pd.notna(v) and bool(v)
+with tabs[0]:
+    status = {
+        "current_low": ("danger", "قند فعلی پایین است", "آخرین خوانش در محدوده افت قرار دارد."),
+        "predicted_low": ("danger", "هشدار روند فعال است", "مدل ادامه روند را نزدیک یا پایین‌تر از مرز افت می‌بیند."),
+        "preventive_risk": ("warn", "روند نزولی نیازمند توجه است", "هنوز افت قطعی ثبت نشده، اما جهت حرکت قند هشداردهنده است."),
+        "uncertain_trend": ("warn", "روند نامطمئن است", "برای تصمیم بهتر، خوانش‌های بعدی را بررسی کنید."),
+        "no_model_alert": ("good", "هشدار فعالی نیست", "در داده فعلی شواهد کافی برای هشدار وجود ندارد."),
+        "insufficient_data": ("neutral", "سابقه کافی نیست", "برای پیش‌بینی کامل به حدود یک ساعت داده پیوسته نیاز است."),
+        "short_history": ("neutral", "سابقه کوتاه است", "فعلاً فقط روند کوتاه‌مدت قابل بررسی است."),
+        "stale": ("neutral", "داده قدیمی است", "پیش‌بینی جاری با داده قدیمی معتبر نیست."),
+        "sensor_check": ("neutral", "خوانش سنسور نامعتبر است", "آخرین مقدار قابل اعتماد نیست.")}
+    cls, title, description = status.get(state["status"], ("neutral", "وضعیت نامشخص", ""))
+    st.markdown(f'<div class="status {cls}"><b>{title}</b><br>{description}</div>', unsafe_allow_html=True)
+    if state.get("row") is not None:
+        row = state["row"]
+        left, mid, right = st.columns(3)
+        left.metric("قند فعلی", f"{row.Current_Glucose:.0f} mg/dL")
+        mid.metric("روند ۱۵ دقیقه اخیر", trend_label(row.ROC_15m), f"شیب {row.ROC_15m:.2f}")
+        right.metric("تداوم نزول", f"{row.Downward_Persistence:.0f}%")
+        st.subheader("پیش‌بینی کوتاه‌مدت")
+        cols = st.columns(len(HORIZONS))
+        for column, horizon in zip(cols, HORIZONS):
+            alert = is_true(row[f"Alert_{horizon}m"])
+            css = "alert" if alert else ""
+            label = "هشدار" if alert else "بدون هشدار"
+            column.markdown(f'<div class="horizon {css}"><b>{horizon} دقیقه بعد</b><h3>{row[f"Pred_Glucose_{horizon}m"]:.0f} mg/dL</h3><span class="muted">{label}</span></div>', unsafe_allow_html=True)
+    fig = go.Figure()
+    fig.add_scatter(x=analysis.index, y=analysis["Raw"], name="قند ثبت‌شده", connectgaps=False, line={"color":"#94a3b8"})
+    fig.add_scatter(x=analysis.index, y=analysis["Current_Glucose"], name="روند هموار", connectgaps=False, line={"color":"#0f766e", "width":3})
+    fig.add_hline(y=70, line_dash="dash", line_color="#dc2626", annotation_text="مرز افت ۷۰")
+    fig.update_layout(height=390, hovermode="x unified", yaxis_title="mg/dL", xaxis_title="زمان", margin={"l":10,"r":10,"t":20,"b":10})
+    st.plotly_chart(fig, use_container_width=True)
 
-if state.get("row") is not None:
-    row=state["row"]
-    st.subheader("خلاصه قابل فهم از وضعیت")
-    a,b,c,d=st.columns(4)
-    a.metric("قند فعلی پس از صاف‌سازی",f"{row.Current_Glucose:.1f} mg/dL")
-    b.metric("جهت حرکت در ۱۵ دقیقه",f"{row.ROC_15m:.2f}",help="عدد منفی یعنی قند در حال پایین آمدن است.")
-    c.metric("چند درصد مسیر نزولی بوده؟",f"{row.Downward_Persistence:.0f}%",help="درصد خوانش‌های نزولی در یک ساعت اخیر.")
-    d.metric("امتیاز هشدار داخلی",f"{row.Low_Risk_Score:.0f} از ۱۰۰",help="امتیاز فنی برای مقایسه روندهاست، نه احتمال پزشکی.")
-    st.subheader("پیش‌بینی سه بازه زمانی")
-    cols=st.columns(3)
-    for col,h in zip(cols,HORIZONS):
-        alert=_is_true(row[f"Alert_{h}m"] == 1); cls="danger" if alert else "good"; label="هشدار روند" if alert else "بدون هشدار"
-        col.markdown(f'<div class="card {cls}"><h4>{h} دقیقه بعد</h4><h2>{row[f"Pred_Glucose_{h}m"]:.1f} <small>mg/dL</small></h2><p>{label}</p><p>مرز افت: ۷۰ mg/dL</p></div>',unsafe_allow_html=True)
+with tabs[1]:
+    st.subheader("خوانش‌ها، پیش‌بینی و پیام قابل ارسال")
+    st.caption("ردیف‌های هشدار با پیام قابل ارسال مشخص‌اند. در حالت ورود دستی، زمان‌ها با فاصله ۵ دقیقه ساخته می‌شوند.")
+    display = pd.DataFrame({"زمان": analysis.index.astype(str), "قند ثبت‌شده": analysis["Raw"].round(1), "قند هموار": analysis["Current_Glucose"].round(1), "روند": analysis["ROC_15m"].map(trend_label), **{f"پیش‌بینی {h} دقیقه": analysis[f"Pred_Glucose_{h}m"].round(1) for h in HORIZONS}, "هشدار": analysis["Alert_30m"].map({1:"بله",0:"خیر"}), "پیام کاربر": [plain_message(analysis.iloc[i]) for i in range(len(analysis))]})
+    alerts_only = st.toggle("فقط ردیف‌های هشدار را نمایش بده")
+    if alerts_only:
+        display = display.loc[analysis["Alert_30m"].fillna(0).eq(1).to_numpy()]
+    st.dataframe(display, use_container_width=True, hide_index=True, height=560)
 
-with st.expander("چطور به این نتیجه رسیدیم؟", expanded=False):
-    steps=[("۱. مرتب‌سازی","زمان‌ها پاک‌سازی و داده روی فاصله‌های منظم ۵ دقیقه‌ای قرار می‌گیرد."),("۲. کاهش نویز","نوسان‌های لحظه‌ای سنسور نرم می‌شوند."),("۳. اندازه‌گیری روند","سرعت، شتاب، فاصله تا ۷۰ و تداوم نزول محاسبه می‌شوند."),("۴. نگاه به آینده","روند فعلی برای افق‌های ۱۰ تا ۳۰ دقیقه جلو برده می‌شود."),("۵. اولویت جلسه","مدل پیش‌فرض حساسیت را بیشتر می‌کند تا افت‌های واقعی کمتری از دست بروند."),("۶. یک افت = یک رویداد","هشدارهای پشت‌سرهم برای یک روند واحد یکی حساب می‌شوند.")]
-    for name,text in steps: st.markdown(f'<div class="step"><b>{name}</b><br>{text}</div>',unsafe_allow_html=True)
+with tabs[2]:
+    st.subheader("عملکرد مدل روی همین فایل")
+    if manual_mode:
+        st.info("در ورود دستی، آینده واقعی هنوز ثبت نشده است؛ بنابراین درست یا غلط بودن هشدارها قابل ارزیابی نیست. پیش‌بینی‌ها در جدول قبلی نمایش داده شده‌اند.")
+    else:
+        event30 = event_metrics.loc[event_metrics["Horizon_min"].eq(30)].iloc[0]
+        row30 = row_metrics.loc[row_metrics["Horizon_min"].eq(30)].iloc[0]
+        actual = int(event30["All_events"])
+        detected = int(event30["Captured"])
+        missed = int(event30["Missed_eligible"] + event30["No_opportunity"])
+        false_alerts = int(row30["Notification_FP"])
+        precision = float(row30["Precision"]) if pd.notna(row30["Precision"]) else 0.0
+        recall = float(event30["Recall_eligible_events"]) if pd.notna(event30["Recall_eligible_events"]) else 0.0
+        false_alert_component = max(0, 1 - false_alerts / max(1, false_alerts + int(row30["Notification_TP"])))
+        score = round(100 * (0.60 * recall + 0.25 * precision + 0.15 * false_alert_component))
+        c1,c2,c3,c4,c5,c6=st.columns(6)
+        c1.metric("افت واقعی فایل", actual)
+        c2.metric("افت شناسایی‌شده", detected)
+        c3.metric("افت شناسایی‌نشده", missed)
+        c4.metric("هشدار کاذب", false_alerts)
+        c5.metric("دقت هشدار", f"{precision*100:.1f}%")
+        c6.metric("امتیاز فایل", f"{max(0,min(100,score))}/100")
+        feedback = []
+        if recall < .80: feedback.append("مدل بخشی از افت‌های واقعی را ندیده است؛ حساسیت این فایل پایین‌تر از هدف است.")
+        if precision < .50: feedback.append("هشدارهای کاذب در این فایل قابل توجه‌اند؛ این حالت معمولاً در روندهای برگشتی یا ناپایدار رخ می‌دهد.")
+        if not feedback: feedback.append("عملکرد این فایل از نظر پوشش افت و دقت هشدار متعادل است.")
+        st.write("**نقد خودکار:** " + " ".join(feedback))
+        st.dataframe(events, use_container_width=True, hide_index=True)
 
-fig=go.Figure(); fig.add_scatter(x=analysis.index,y=analysis["Raw"],name="عدد خام سنسور",connectgaps=False); fig.add_scatter(x=analysis.index,y=analysis["Current_Glucose"],name="روند صاف‌شده",connectgaps=False); fig.add_hline(y=70,line_color="red",line_dash="dash",annotation_text="مرز افت ۷۰"); fig.update_layout(height=420,hovermode="x unified",xaxis_title="زمان",yaxis_title="mg/dL",legend_title="توضیح نمودار")
-st.plotly_chart(fig,use_container_width=True)
-
-st.header("جدول تصمیم‌های مدل")
-st.caption("هر ردیف یک خوانش پنج‌دقیقه‌ای است. ستون «پیام کاربر» نشان می‌دهد اگر همان لحظه اعلان ارسال شود، متن قابل نمایش چه خواهد بود.")
-def _trend(v):
-    if pd.isna(v): return "سابقه کافی نیست"
-    if v < -0.10: return "نزولی"
-    if v > 0.10: return "صعودی"
-    return "تقریباً ثابت"
-def _message(r):
-    if _is_true(r.get("Notification_30m", False)):
-        if _is_true(r.get("Fast_Drop_Risk", False)): return "افت سریع دیده شد؛ روند قند را فوراً بررسی کنید."
-        if _is_true(r.get("Preventive_Alert", False)): return "روند نزولی پایدار است؛ قند را زودتر بررسی کنید."
-        return "ادامه روند فعلی می‌تواند به افت قند منجر شود؛ روند را بررسی کنید."
-    alert = r.get("Alert_30m", 0)
-    if pd.notna(alert) and alert == 1: return "روند نیازمند پایش است؛ هنوز اعلان اصلی ارسال نشده است."
-    return "اعلان فعالی نیست."
-view = analysis.copy()
-table = pd.DataFrame({
-    "زمان": view.index.astype(str),
-    "قند ثبت‌شده": view["Raw"].round(1),
-    "قند هموارشده": view["Current_Glucose"].round(1),
-    "روند ۱۵ دقیقه": view["ROC_15m"].map(_trend),
-    "شیب (واحد/دقیقه)": view["ROC_15m"].round(2),
-    **{f"پیش‌بینی {h} دقیقه": view[f"Pred_Glucose_{h}m"].round(1) for h in HORIZONS},
-    "هشدار نزدیک‌ترین افق": view[f"Alert_{HORIZONS[0]}m"].map({1:"بله",0:"خیر"}),
-    "پیام کاربر": [_message(view.iloc[i]) for i in range(len(view))],
-}, index=view.index)
-st.dataframe(table, use_container_width=True, hide_index=True)
-
-st.header("ارزیابی همین فایل")
-if source == "ورود دستی":
-    st.info("در ورود دستی آینده واقعی وجود ندارد؛ بنابراین درست/غلط بودن هشدار و امتیاز عملکرد تا زمانی که خوانش‌های بعدی وارد نشوند قابل محاسبه نیست.")
-else:
-    r30 = rows.loc[rows["Horizon_min"].eq(30)].iloc[0]
-    e30 = event_summary.loc[event_summary["Horizon_min"].eq(30)].iloc[0]
-    actual_events = int(e30["All_events"])
-    captured = int(e30["Captured"]); eligible = int(e30["Eligible_events"]); missed = int(e30["Missed_eligible"] + e30["No_opportunity"])
-    false_alerts = int(r30["Notification_FP"])
-    precision = float(r30["Precision"]) if pd.notna(r30["Precision"]) else 0.0
-    recall = float(e30["Recall_eligible_events"]) if pd.notna(e30["Recall_eligible_events"]) else 0.0
-    score = max(0, min(100, round(100 * (0.55 * recall + 0.35 * precision + 0.10 * max(0, 1 - false_alerts / max(1, int(r30["Notification_TP"] + false_alerts)))))))
-    m1,m2,m3,m4,m5,m6=st.columns(6)
-    m1.metric("کل افت‌های واقعی فایل", actual_events, help="تعداد رویدادهایی که کمترین قند آینده آن‌ها به ۷۰ یا کمتر رسیده است.")
-    m2.metric("افت شناسایی‌شده", captured)
-    m3.metric("افت شناسایی‌نشده", missed)
-    m4.metric("هشدار کاذب", false_alerts)
-    m5.metric("دقت هشدار", f"{precision*100:.1f}%")
-    m6.metric("امتیاز این فایل", f"{score}/100")
-    notes=[]
-    if recall < .80: notes.append("بخشی از افت‌های واقعی قبل از هشدار از دست رفته‌اند؛ حساسیت باید بررسی شود.")
-    if precision < .50: notes.append("هشدار کاذب زیاد است؛ برگشت قند و روندهای ناپایدار علت محتمل هستند.")
-    if not notes: notes.append("تعادل حساسیت و دقت در این فایل قابل قبول است، اما نتیجه جایگزین اعتبارسنجی بالینی نیست.")
-    st.markdown("**نقد خودکار فایل:** " + " ".join(notes))
-
-with st.expander("فرمول‌ها و معنی شاخص‌ها"):
+with tabs[3]:
+    st.subheader("مدل با چه منطقی محاسبه می‌کند؟")
     st.markdown("""
-**مرز افت:** قند ۷۰ mg/dL یا کمتر.  
-**شیب:** تغییر متوسط قند در ۱۵ دقیقه اخیر؛ عدد منفی یعنی روند نزولی.  
-**شتاب:** تغییر خودِ شیب؛ مثبت‌شدن آن می‌تواند نشانه کندشدن افت یا برگشت قند باشد.  
-**تداوم نزول:** درصد تغییرات نزولی در حدود یک ساعت اخیر.  
-**پیش‌بینی:** قند فعلی + شیب پایدار × تعداد دقیقه آینده.  
-**افت واقعی:** کمترین قند ثبت‌شده در پنجره آینده به ۷۰ یا کمتر برسد.  
-**حساسیت:** چند درصد افت‌های واقعی شناسایی شده‌اند.  
-**دقت:** چند درصد اعلان‌ها واقعاً با افت همراه بوده‌اند.  
-**هشدار کاذب:** اعلان صادر شده اما در پنجره بررسی افت واقعی رخ نداده است.  
-**امتیاز فایل:** ترکیبی از حساسیت، دقت و جریمه هشدار کاذب است؛ احتمال پزشکی نیست.
+1. داده‌ها پاک‌سازی و روی فاصله‌های منظم ۵ دقیقه‌ای مرتب می‌شوند.
+2. نوسان‌های کوتاه سنسور با هموارسازی کاهش می‌یابند.
+3. قند فعلی، شیب ۱۵ دقیقه، شتاب، فاصله تا ۷۰ و تداوم نزول محاسبه می‌شود.
+4. پیش‌بینی هر افق از فرمول «قند فعلی + شیب پایدار × زمان آینده» ساخته می‌شود.
+5. مدل Enhanced برای بیشترین شناسایی افت استفاده می‌شود. حالت Recovery فقط روندهایی را که نشانه برگشت دارند محدود می‌کند.
+6. افت واقعی یعنی کمترین قند پنجره آینده به ۷۰ یا کمتر برسد. هشدار کاذب یعنی اعلان صادر شود ولی در پنجره آینده افت رخ ندهد.
     """)
+    with st.expander("معنی شاخص‌ها"):
+        st.markdown("**شیب:** سرعت تغییر قند؛ عدد منفی یعنی افت.  \n**شتاب:** افت در حال سریع‌ترشدن یا کندشدن است.  \n**تداوم نزول:** درصد تغییرات نزولی اخیر.  \n**دقت:** سهم اعلان‌های درست.  \n**حساسیت:** سهم افت‌های واقعی که شناسایی شده‌اند.")
 
-with st.expander("جزئیات فنی و ارزیابی مدل (اختیاری)"):
-    st.caption("این بخش برای بررسی فنی است. جدول‌های اصلی عمداً مخفی هستند تا استفاده روزمره ساده بماند.")
-    st.write("خلاصه رویدادهای افت"); st.dataframe(event_summary,use_container_width=True,hide_index=True)
-    st.write("ارزیابی خوانش‌ها"); st.dataframe(rows,use_container_width=True,hide_index=True)
-    st.write("داده فنی آخرین ۳۰۰ ردیف"); st.dataframe(analysis.tail(300),use_container_width=True)
-    st.json(metadata)
-st.download_button("دانلود گزارش کامل Excel",excel_bytes(analysis,rows,metadata,events,event_summary),"CGM_recovery_analysis.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+st.download_button("دانلود گزارش کامل Excel", excel_bytes(analysis, row_metrics, metadata, events, event_metrics), "CGM_hypo_report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
