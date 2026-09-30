@@ -26,7 +26,10 @@ class ModelConfig:
     curvature_rescue_max_acceleration: float = -0.05
     event_recovery_margin: float = 5.0
     event_recovery_confirmations: int = 2
-    primary_horizon: int = 20
+    # Development-data profile: 25 minutes retained nearly the 30-minute
+    # capture rate while producing fewer false notifications than 30 minutes.
+    # The dashboard always lets the user select any configured horizon.
+    primary_horizon: int = 25
     target_precision: float = 0.95
 
     def __post_init__(self):
