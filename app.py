@@ -25,14 +25,14 @@ def is_true(value):
     return pd.notna(value) and bool(value)
 
 
-def plain_message(row):
-    if is_true(row.get("Notification_30m", False)):
+def plain_message(row, primary_horizon, threshold):
+    if is_true(row.get(f"Notification_{primary_horizon}m", False)):
         if is_true(row.get("Fast_Drop_Risk", False)):
             return "افت سریع دیده شده است؛ روند قند را بررسی کنید."
         if is_true(row.get("Preventive_Alert", False)):
             return "روند نزولی پایدار است؛ قند را زودتر بررسی کنید."
-        return "ادامه روند فعلی ممکن است به افت قند منجر شود؛ روند را بررسی کنید."
-    if is_true(row.get("Alert_30m", False)):
+        return f"تا {primary_horizon} دقیقه آینده احتمال رسیدن قند به {threshold:.0f} وجود دارد؛ روند را بررسی کنید."
+    if is_true(row.get(f"Alert_{primary_horizon}m", False)):
         return "روند نیازمند پایش است؛ اعلان اصلی هنوز ارسال نشده است."
     return "اعلان فعالی نیست."
 
@@ -53,11 +53,9 @@ def load_uploaded_file(content, filename):
     return pd.read_csv(buffer) if filename.lower().endswith(".csv") else pd.read_excel(buffer)
 
 
-def run_analysis(frame, time_column, glucose_column, timezone_name, unit_name, stream_column_names, model_method):
+def run_analysis(frame, time_column, glucose_column, input_config, model_config, stream_column_names, model_method):
     """Run once per interaction; caching full dataframes can exhaust Cloud memory."""
-    inputs = InputConfig(timezone=timezone_name, unit=unit_name)
-    config = ModelConfig()
-    return analyze(frame, time_column, glucose_column, inputs, config,
+    return analyze(frame, time_column, glucose_column, input_config, model_config,
                    stream_columns=list(stream_column_names), method=model_method)
 
 
@@ -126,12 +124,18 @@ with st.sidebar:
     st.header("تنظیمات")
     timezone = st.text_input("منطقه زمانی", "Asia/Tehran")
     unit = st.selectbox("واحد قند", ["mg/dL", "mmol/L"])
+    threshold = st.number_input("مرز افت برای هشدار (mg/dL)", min_value=54.0, max_value=100.0, value=70.0, step=1.0,
+        help="هر مقدار مساوی یا پایین‌تر از این عدد، افت قند محسوب می‌شود و مبنای ارزیابی هشدارهاست.")
+    primary_horizon = st.selectbox("زمان هشدار اصلی پیش از افت", [15, 20, 30], index=1,
+        help="پیام اصلی، وضعیت داشبورد و ارزیابی فایل بر اساس این افق ساخته می‌شوند. افق‌های دیگر برای مقایسه باقی می‌مانند.")
+    st.caption("۲۰ دقیقه، بر اساس ارزیابی فعلی، بهترین تعادل بین شناسایی افت و هشدار کاذب را داشته است.")
 
 try:
+    inputs = InputConfig(timezone=timezone, unit=unit)
+    config = ModelConfig(threshold=float(threshold), primary_horizon=int(primary_horizon))
     with st.spinner("در حال پردازش فایل و ساخت گزارش…"):
         analysis, row_metrics, events, event_metrics, metadata = run_analysis(
-            frame, time_col, glucose_col, timezone, unit, tuple(stream_columns), method)
-    config = ModelConfig()
+            frame, time_col, glucose_col, inputs, config, tuple(stream_columns), method)
     state = latest_state(analysis, metadata, config)
 except Exception as exc:
     st.error(f"تحلیل انجام نشد: {exc}")
@@ -158,13 +162,14 @@ with tabs[0]:
         left.metric("قند فعلی", f"{row.Current_Glucose:.0f} mg/dL")
         mid.metric("روند ۱۵ دقیقه اخیر", trend_label(row.ROC_15m), f"شیب {row.ROC_15m:.2f}")
         right.metric("تداوم نزول", f"{row.Downward_Persistence:.0f}%")
-        st.subheader("پیش‌بینی کوتاه‌مدت")
+        st.subheader(f"پیش‌بینی کوتاه‌مدت — هشدار اصلی: {config.primary_horizon} دقیقه")
         cols = st.columns(len(HORIZONS))
         for column, horizon in zip(cols, HORIZONS):
             alert = is_true(row[f"Alert_{horizon}m"])
             css = "alert" if alert else ""
             label = "هشدار" if alert else "بدون هشدار"
-            column.markdown(f'<div class="horizon {css}"><b>{horizon} دقیقه بعد</b><h3>{row[f"Pred_Glucose_{horizon}m"]:.0f} mg/dL</h3><span class="muted">{label}</span></div>', unsafe_allow_html=True)
+            primary = " · انتخاب اصلی" if horizon == config.primary_horizon else ""
+            column.markdown(f'<div class="horizon {css}"><b>{horizon} دقیقه بعد{primary}</b><h3>{row[f"Pred_Glucose_{horizon}m"]:.0f} mg/dL</h3><span class="muted">{label}</span></div>', unsafe_allow_html=True)
     fig = go.Figure()
     fig.add_scatter(x=analysis.index, y=analysis["Raw"], name="قند ثبت‌شده", connectgaps=False, line={"color":"#94a3b8"})
     fig.add_scatter(x=analysis.index, y=analysis["Current_Glucose"], name="روند هموار", connectgaps=False, line={"color":"#0f766e", "width":3})
@@ -175,10 +180,10 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("خوانش‌ها، پیش‌بینی و پیام قابل ارسال")
     st.caption("ردیف‌های هشدار با پیام قابل ارسال مشخص‌اند. در حالت ورود دستی، زمان‌ها با فاصله ۵ دقیقه ساخته می‌شوند.")
-    display = pd.DataFrame({"زمان": analysis.index.astype(str), "قند ثبت‌شده": analysis["Raw"].round(1), "قند هموار": analysis["Current_Glucose"].round(1), "روند": analysis["ROC_15m"].map(trend_label), **{f"پیش‌بینی {h} دقیقه": analysis[f"Pred_Glucose_{h}m"].round(1) for h in HORIZONS}, "هشدار": analysis["Alert_30m"].map({1:"بله",0:"خیر"}), "پیام کاربر": [plain_message(analysis.iloc[i]) for i in range(len(analysis))]})
+    display = pd.DataFrame({"زمان": analysis.index.astype(str), "قند ثبت‌شده": analysis["Raw"].round(1), "قند هموار": analysis["Current_Glucose"].round(1), "روند": analysis["ROC_15m"].map(trend_label), **{f"پیش‌بینی {h} دقیقه": analysis[f"Pred_Glucose_{h}m"].round(1) for h in HORIZONS}, f"هشدار اصلی {config.primary_horizon} دقیقه": analysis[f"Alert_{config.primary_horizon}m"].map({1:"بله",0:"خیر"}), "پیام کاربر": [plain_message(analysis.iloc[i], config.primary_horizon, config.threshold) for i in range(len(analysis))]})
     alerts_only = st.toggle("فقط ردیف‌های هشدار را نمایش بده")
     if alerts_only:
-        display = display.loc[analysis["Alert_30m"].fillna(0).eq(1).to_numpy()]
+        display = display.loc[analysis[f"Alert_{config.primary_horizon}m"].fillna(0).eq(1).to_numpy()]
     page_size = st.selectbox("تعداد ردیف در هر صفحه", [50, 100, 250], index=1)
     total_pages = max(1, (len(display) + page_size - 1) // page_size)
     page = st.number_input("شماره صفحه", min_value=1, max_value=total_pages, value=1, step=1)
@@ -191,15 +196,16 @@ with tabs[2]:
     if manual_mode:
         st.info("در ورود دستی، آینده واقعی هنوز ثبت نشده است؛ بنابراین درست یا غلط بودن هشدارها قابل ارزیابی نیست. پیش‌بینی‌ها در جدول قبلی نمایش داده شده‌اند.")
     else:
-        event30 = event_metrics.loc[event_metrics["Horizon_min"].eq(30)].iloc[0]
-        row30 = row_metrics.loc[row_metrics["Horizon_min"].eq(30)].iloc[0]
-        actual = int(event30["All_events"])
-        detected = int(event30["Captured"])
-        missed = int(event30["Missed_eligible"] + event30["No_opportunity"])
-        false_alerts = int(row30["Notification_FP"])
-        precision = float(row30["Precision"]) if pd.notna(row30["Precision"]) else 0.0
-        recall = float(event30["Recall_eligible_events"]) if pd.notna(event30["Recall_eligible_events"]) else 0.0
-        false_alert_component = max(0, 1 - false_alerts / max(1, false_alerts + int(row30["Notification_TP"])))
+        event_primary = event_metrics.loc[event_metrics["Horizon_min"].eq(config.primary_horizon)].iloc[0]
+        row_primary = row_metrics.loc[row_metrics["Horizon_min"].eq(config.primary_horizon)].iloc[0]
+        actual = int(event_primary["All_events"])
+        detected = int(event_primary["Captured"])
+        missed = int(event_primary["Missed_eligible"] + event_primary["No_opportunity"])
+        correct_alerts = int(row_primary["Notification_TP"])
+        false_alerts = int(row_primary["Notification_FP"])
+        precision = correct_alerts / max(1, correct_alerts + false_alerts)
+        recall = float(event_primary["Recall_eligible_events"]) if pd.notna(event_primary["Recall_eligible_events"]) else 0.0
+        false_alert_component = max(0, 1 - false_alerts / max(1, false_alerts + correct_alerts))
         score = round(100 * (0.60 * recall + 0.25 * precision + 0.15 * false_alert_component))
         c1,c2,c3,c4,c5,c6=st.columns(6)
         c1.metric("افت واقعی فایل", actual)
@@ -212,7 +218,14 @@ with tabs[2]:
         if recall < .80: feedback.append("مدل بخشی از افت‌های واقعی را ندیده است؛ حساسیت این فایل پایین‌تر از هدف است.")
         if precision < .50: feedback.append("هشدارهای کاذب در این فایل قابل توجه‌اند؛ این حالت معمولاً در روندهای برگشتی یا ناپایدار رخ می‌دهد.")
         if not feedback: feedback.append("عملکرد این فایل از نظر پوشش افت و دقت هشدار متعادل است.")
-        st.write("**نقد خودکار:** " + " ".join(feedback))
+        st.write(f"**ارزیابی بر مبنای مرز {config.threshold:.0f} و هشدار {config.primary_horizon} دقیقه‌ای:** " + " ".join(feedback))
+        comparison = row_metrics[["Horizon_min", "Notification_TP", "Notification_FP"]].merge(
+            event_metrics[["Horizon_min", "Captured", "Recall_eligible_events"]], on="Horizon_min")
+        comparison["دقت اعلان"] = comparison["Notification_TP"] / (comparison["Notification_TP"] + comparison["Notification_FP"]).replace(0, pd.NA)
+        comparison = comparison.rename(columns={"Horizon_min":"افق (دقیقه)", "Notification_TP":"هشدار درست", "Notification_FP":"هشدار کاذب", "Captured":"افت شناسایی‌شده", "Recall_eligible_events":"پوشش افت"})
+        st.caption("مقایسه همه افق‌ها برای همین فایل")
+        st.dataframe(comparison, use_container_width=True, hide_index=True,
+            column_config={"دقت اعلان":st.column_config.NumberColumn(format="%.1f%%"), "پوشش افت":st.column_config.NumberColumn(format="%.1f%%")})
         st.dataframe(events, use_container_width=True, hide_index=True)
 
 with tabs[3]:
@@ -220,10 +233,11 @@ with tabs[3]:
     st.markdown("""
 1. داده‌ها پاک‌سازی و روی فاصله‌های منظم ۵ دقیقه‌ای مرتب می‌شوند.
 2. نوسان‌های کوتاه سنسور با هموارسازی کاهش می‌یابند.
-3. قند فعلی، شیب ۱۵ دقیقه، شتاب، فاصله تا ۷۰ و تداوم نزول محاسبه می‌شود.
-4. پیش‌بینی هر افق از فرمول «قند فعلی + شیب پایدار × زمان آینده» ساخته می‌شود.
+3. قند فعلی، شیب ۱۵ دقیقه، شتاب، فاصله تا مرز افت انتخاب‌شده و تداوم نزول محاسبه می‌شود.
+4. کاربر مرز افت را تعیین می‌کند. پیش‌بینی هر افق از فرمول «قند فعلی + شیب پایدار × زمان آینده» ساخته می‌شود.
 5. مدل Enhanced برای بیشترین شناسایی افت استفاده می‌شود. حالت Recovery فقط روندهایی را که نشانه برگشت دارند محدود می‌کند.
-6. افت واقعی یعنی کمترین قند پنجره آینده به ۷۰ یا کمتر برسد. هشدار کاذب یعنی اعلان صادر شود ولی در پنجره آینده افت رخ ندهد.
+6. کاربر افق اصلی ۱۵، ۲۰ یا ۳۰ دقیقه را انتخاب می‌کند. پیام کاربر و ارزیابی اصلی با همان افق ساخته می‌شوند.
+7. افت واقعی یعنی کمترین قند پنجره آینده به مرز انتخاب‌شده یا کمتر برسد. هشدار کاذب یعنی اعلان صادر شود ولی در پنجره آینده افت رخ ندهد.
     """)
     with st.expander("معنی شاخص‌ها"):
         st.markdown("**شیب:** سرعت تغییر قند؛ عدد منفی یعنی افت.  \n**شتاب:** افت در حال سریع‌ترشدن یا کندشدن است.  \n**تداوم نزول:** درصد تغییرات نزولی اخیر.  \n**دقت:** سهم اعلان‌های درست.  \n**حساسیت:** سهم افت‌های واقعی که شناسایی شده‌اند.")

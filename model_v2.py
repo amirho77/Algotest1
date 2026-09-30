@@ -115,9 +115,9 @@ def latest_state(predictions, metadata, cfg=None):
         status = "sensor_check"
     elif row is None or not row.Prediction_Ready:
         status = "insufficient_data"
-    elif any(row[f"Alert_{h}m"]==1 for h in HORIZONS):
+    elif row[f"Alert_{cfg.primary_horizon}m"]==1:
         status = "predicted_low"
-    elif row.Trend_Disagreement or any(row[f"Watch_{h}m"]==1 for h in HORIZONS):
+    elif row.Trend_Disagreement or row[f"Watch_{cfg.primary_horizon}m"]==1:
         status = "uncertain_trend"
     else:
         status = "no_model_alert"

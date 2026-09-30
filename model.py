@@ -191,7 +191,7 @@ def latest_state(predictions, metadata, cfg=None):
         row = completed.iloc[-1]
         if row.Alert_Ready:
             state["alert_row"] = row
-            forecast_active = any(row[f"Forecast_Alert_{h}m"] == 1 for h in HORIZONS)
+            forecast_active = row[f"Forecast_Alert_{cfg.primary_horizon}m"] == 1
             if row.Preventive_Alert and not forecast_active:
                 state["status"] = "preventive_risk"
                 state["preventive_reasons"] = row.Alert_Reason.split("|")

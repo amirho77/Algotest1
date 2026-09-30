@@ -16,7 +16,9 @@ def analyze(frame, time_col, glucose_col, input_config=None, model_config=None, 
     events, event_summary=evaluate_events(analysis,cfg)
     metadata.update({"version":VERSION,"method":method,"model_config":cfg.to_dict(),
                      "scenario_band":"Uncalibrated model spread; NOT a confidence interval or probability",
-                     "v3_alert":"Enhanced is the product default because the current product priority is maximum event capture; recovery remains available as a false-alarm control"})
+                     "v3_alert":"Enhanced is the product default because the current product priority is maximum event capture; recovery remains available as a false-alarm control",
+                     "primary_horizon_minutes":cfg.primary_horizon,
+                     "low_threshold_mg_dL":cfg.threshold})
     return analysis, rows, events, event_summary, metadata
 
 

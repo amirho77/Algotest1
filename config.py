@@ -3,7 +3,7 @@ from dataclasses import dataclass, asdict
 import math
 
 HORIZONS = (10, 15, 20, 25, 30)
-VERSION = "3.3.0-enhanced-precision-guard"
+VERSION = "3.4.0-user-threshold-and-horizon"
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,7 @@ class ModelConfig:
     fast_drop_rate: float = 1.2
     preventive_confirmations: int = 2
     strict_confirmations: int = 2
+    primary_horizon: int = 20
     target_precision: float = 0.95
 
     def __post_init__(self):
@@ -34,6 +35,8 @@ class ModelConfig:
             raise ValueError("strict_confirmations must be at least one.")
         if self.preventive_confirmations < 1:
             raise ValueError("preventive_confirmations must be at least one.")
+        if self.primary_horizon not in HORIZONS:
+            raise ValueError(f"primary_horizon must be one of {HORIZONS}.")
         if not math.isfinite(self.target_precision) or not 0 < self.target_precision <= 1:
             raise ValueError("target_precision must be in (0, 1].")
 

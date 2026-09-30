@@ -67,6 +67,11 @@ class InputTests(unittest.TestCase):
         h,_=prepare(f,'time','glucose',InputConfig(unit='mmol/L'))
         np.testing.assert_allclose(g.Raw,h.Raw)
 
+    def test_primary_horizon_must_be_a_configured_horizon(self):
+        self.assertEqual(ModelConfig(primary_horizon=20).primary_horizon,20)
+        with self.assertRaises(ValueError):
+            ModelConfig(primary_horizon=17)
+
     def test_conflicting_duplicates_abstain(self):
         f=frame(); f=pd.concat([f,pd.DataFrame({'time':[f.time.iloc[20]],'glucose':[55]})],ignore_index=True)
         g,m=prepare(f,'time','glucose')
