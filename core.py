@@ -16,7 +16,7 @@ def analyze(frame, time_col, glucose_col, input_config=None, model_config=None, 
     events, event_summary=evaluate_events(analysis,cfg)
     metadata.update({"version":VERSION,"method":method,"model_config":cfg.to_dict(),
                      "scenario_band":"Uncalibrated model spread; NOT a confidence interval or probability",
-                     "v3_alert":"Guarded is the product default: normal alerts require causal trend agreement and dual confirmation, while rapid descent keeps an immediate rescue path. Enhanced and recovery remain available for comparison.",
+                     "v3_alert":"Guarded is the product default: normal alerts require causal trend agreement and dual confirmation. Rapid descent and a near-threshold accelerating descent retain limited rescue paths. Enhanced and recovery remain available for comparison.",
                      "primary_horizon_minutes":cfg.primary_horizon,
                      "low_threshold_mg_dL":cfg.threshold})
     return analysis, rows, events, event_summary, metadata

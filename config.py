@@ -3,7 +3,7 @@ from dataclasses import dataclass, asdict
 import math
 
 HORIZONS = (10, 15, 20, 25, 30)
-VERSION = "3.5.0-guarded-alert-policy"
+VERSION = "3.6.0-curvature-rescue"
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,9 @@ class ModelConfig:
     guarded_confirmations: int = 2
     guarded_approach_margin: float = 12.0
     guarded_approach_rate: float = 0.4
+    curvature_rescue_margin: float = 10.0
+    curvature_rescue_max_roc: float = -0.10
+    curvature_rescue_max_acceleration: float = -0.05
     event_recovery_margin: float = 5.0
     event_recovery_confirmations: int = 2
     primary_horizon: int = 20
@@ -47,6 +50,12 @@ class ModelConfig:
         for value in (self.guarded_approach_margin, self.guarded_approach_rate, self.event_recovery_margin):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError("Guarded approach settings must be positive and finite.")
+        if not math.isfinite(self.curvature_rescue_margin) or self.curvature_rescue_margin <= 0:
+            raise ValueError("curvature_rescue_margin must be positive and finite.")
+        if not math.isfinite(self.curvature_rescue_max_roc) or self.curvature_rescue_max_roc >= 0:
+            raise ValueError("curvature_rescue_max_roc must be finite and negative.")
+        if not math.isfinite(self.curvature_rescue_max_acceleration) or self.curvature_rescue_max_acceleration >= 0:
+            raise ValueError("curvature_rescue_max_acceleration must be finite and negative.")
         if self.primary_horizon not in HORIZONS:
             raise ValueError(f"primary_horizon must be one of {HORIZONS}.")
         if not math.isfinite(self.target_precision) or not 0 < self.target_precision <= 1:

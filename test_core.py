@@ -199,6 +199,14 @@ class ScenarioTests(unittest.TestCase):
         self.assertTrue(guarded.Fast_Drop_Risk.iloc[-3])
         self.assertEqual(guarded.Alert_30m.iloc[-3],1)
 
+    def test_guarded_policy_marks_accelerating_drop_near_boundary(self):
+        values=np.r_[np.full(12,110.),[108,106,103,98,90,80]]
+        grid,_=prepare(frame(values),"time","glucose")
+        guarded=predict(grid,method="guarded")
+        self.assertTrue(guarded.Curvature_Drop_Risk.iloc[-1])
+        self.assertTrue(guarded.Curvature_Crossing_20m.iloc[-1])
+        self.assertIn("accelerating_drop",guarded.Alert_Reason.iloc[-1])
+
     def test_preventive_recent_low_after_recovery(self):
         a,_,_=compute(frame(np.r_[np.full(56,150.),[65,68,72,75]]))
         self.assertTrue(a.Recent_Low_Risk.iloc[-1])

@@ -18,6 +18,7 @@ def predict(grid, cfg=None, *, method="enhanced"):
     out["Recent_Low_Risk"] = False
     out["Fast_Drop_Risk"] = False
     out["Approaching_Low_Risk"] = False
+    out["Curvature_Drop_Risk"] = False
     out["Recovery_Filter"] = False
     out["Fast_ROC_10m"] = np.nan
     out["Alert_Reason"] = ""
@@ -32,6 +33,7 @@ def predict(grid, cfg=None, *, method="enhanced"):
     recent = np.zeros(n, dtype=bool)
     fast = np.zeros(n, dtype=bool)
     approaching = np.zeros(n, dtype=bool)
+    curvature = np.zeros(n, dtype=bool)
     rates = np.full(n, np.nan)
     if n >= 3:
         window = np.lib.stride_tricks.sliding_window_view(raw, 3)
@@ -51,6 +53,13 @@ def predict(grid, cfg=None, *, method="enhanced"):
             approaching[indices] = (above & (np.diff(y, axis=1) < 0).all(axis=1)
                                     & (rate <= -cfg.guarded_approach_rate)
                                     & (y[:, -1] <= cfg.threshold + cfg.guarded_approach_margin))
+    # Some real falls begin with modest velocity but a clearly worsening
+    # velocity. Admit this narrow rescue only near the boundary; the later
+    # per-horizon quadratic crossing test decides whether it is actionable.
+    curvature = (short_ready & (raw > cfg.threshold)
+                 & (raw <= cfg.threshold + cfg.curvature_rescue_margin)
+                 & out.ROC_15m.le(cfg.curvature_rescue_max_roc).fillna(False).to_numpy(bool)
+                 & out.Acceleration.le(cfg.curvature_rescue_max_acceleration).fillna(False).to_numpy(bool))
     for lag in (1, 2, 3):
         if n <= lag:
             continue
@@ -68,15 +77,16 @@ def predict(grid, cfg=None, *, method="enhanced"):
     elif n >= k_guard:
         near_confirmed[k_guard-1:] = np.lib.stride_tricks.sliding_window_view(near, k_guard).all(axis=1)
         recent_confirmed[k_guard-1:] = np.lib.stride_tricks.sliding_window_view(recent, k_guard).all(axis=1)
-    guard = near_confirmed | recent_confirmed | fast
+    guard = near_confirmed | recent_confirmed | fast | curvature
     out["Alert_Ready"] = short_ready
     out["Preventive_Alert"] = guard
     out["Near_Low_Risk"] = near_confirmed
     out["Recent_Low_Risk"] = recent_confirmed
     out["Fast_Drop_Risk"] = fast
     out["Approaching_Low_Risk"] = approaching
+    out["Curvature_Drop_Risk"] = curvature
     out["Fast_ROC_10m"] = rates
-    out["Alert_Reason"] = ["|".join(name for name, flags in (("near_low", near_confirmed), ("recent_low", recent_confirmed), ("fast_drop", fast)) if flags[i]) for i in range(n)]
+    out["Alert_Reason"] = ["|".join(name for name, flags in (("near_low", near_confirmed), ("recent_low", recent_confirmed), ("fast_drop", fast), ("accelerating_drop", curvature)) if flags[i]) for i in range(n)]
     out["Notification_Event_Id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
     out["Quality_Status"] = out.Quality_Status.where(~(short_ready & ~out.Prediction_Ready), "short_history_guards_only")
     for h in HORIZONS:
@@ -103,6 +113,9 @@ def predict(grid, cfg=None, *, method="enhanced"):
                 two_up[2:] = np.lib.stride_tricks.sliding_window_view(delta[1:], 2).min(axis=1) > 0
             recovery = two_up | out.Acceleration.ge(0.05).fillna(False).to_numpy(bool)
             persistence = out.Downward_Persistence.ge(50).fillna(False).to_numpy(bool)
+            quadratic_prediction = (raw + out.ROC_15m.to_numpy(float) * h
+                                    + 0.5 * out.Acceleration.to_numpy(float) * h * h)
+            curvature_crossing = curvature & np.isfinite(quadratic_prediction) & (quadratic_prediction <= cfg.threshold)
             base = consensus & persistence & ~recovery
             confirmed = np.zeros(n, dtype=bool)
             k = int(cfg.guarded_confirmations)
@@ -110,10 +123,13 @@ def predict(grid, cfg=None, *, method="enhanced"):
                 confirmed = base
             elif n >= k:
                 confirmed[k - 1:] = np.lib.stride_tricks.sliding_window_view(base, k).all(axis=1)
-            combined = confirmed | fast | (approaching & ~recovery) | (near_confirmed & ~recovery) | (recent_confirmed & ~recovery)
+            combined = (confirmed | fast | (curvature_crossing & ~recovery)
+                        | (approaching & ~recovery) | (near_confirmed & ~recovery)
+                        | (recent_confirmed & ~recovery))
             combined &= short_ready
             out[f"Scenario_Votes_{h}m"] = crossings.sum(axis=1)
             out[f"Scenario_Consensus_{h}m"] = consensus
+            out[f"Curvature_Crossing_{h}m"] = curvature_crossing
             out["Recovery_Filter"] = recovery
         if method == "episode":
             # Three-factor episode gate: persistent descent, no recent
