@@ -7,9 +7,9 @@ from model_v2 import predict as predict_v2, latest_state as state_v2
 
 def predict(grid, cfg=None, *, method="enhanced"):
     cfg = cfg or ModelConfig()
-    if method not in ("enhanced", "guarded", "filtered", "episode", "recovery", "high_precision", "precision", "robust", "baseline"):
-        raise ValueError("Choose enhanced, guarded, filtered, episode, recovery, high_precision, precision, robust (v2), or baseline (v1).")
-    out = predict_v2(grid, cfg, method="robust" if method in ("enhanced", "guarded", "filtered", "episode", "recovery", "high_precision", "precision") else method)
+    if method not in ("enhanced", "guarded", "guarded_legacy", "filtered", "episode", "recovery", "high_precision", "precision", "robust", "baseline"):
+        raise ValueError("Choose enhanced, guarded, guarded_legacy, filtered, episode, recovery, high_precision, precision, robust (v2), or baseline (v1).")
+    out = predict_v2(grid, cfg, method="robust" if method in ("enhanced", "guarded", "guarded_legacy", "filtered", "episode", "recovery", "high_precision", "precision") else method)
     for h in HORIZONS:
         out[f"Forecast_Alert_{h}m"] = out[f"Alert_{h}m"].copy()
     out["Alert_Ready"] = out.Prediction_Ready.copy()
@@ -22,7 +22,7 @@ def predict(grid, cfg=None, *, method="enhanced"):
     out["Recovery_Filter"] = False
     out["Fast_ROC_10m"] = np.nan
     out["Alert_Reason"] = ""
-    if method not in ("enhanced", "guarded", "filtered", "episode", "recovery", "high_precision", "precision"):
+    if method not in ("enhanced", "guarded", "guarded_legacy", "filtered", "episode", "recovery", "high_precision", "precision"):
         out.attrs["method"] = method
         return out
     n = len(out)
@@ -56,10 +56,11 @@ def predict(grid, cfg=None, *, method="enhanced"):
     # Some real falls begin with modest velocity but a clearly worsening
     # velocity. Admit this narrow rescue only near the boundary; the later
     # per-horizon quadratic crossing test decides whether it is actionable.
-    curvature = (short_ready & (raw > cfg.threshold)
-                 & (raw <= cfg.threshold + cfg.curvature_rescue_margin)
-                 & out.ROC_15m.le(cfg.curvature_rescue_max_roc).fillna(False).to_numpy(bool)
-                 & out.Acceleration.le(cfg.curvature_rescue_max_acceleration).fillna(False).to_numpy(bool))
+    if method == "guarded":
+        curvature = (short_ready & (raw > cfg.threshold)
+                     & (raw <= cfg.threshold + cfg.curvature_rescue_margin)
+                     & out.ROC_15m.le(cfg.curvature_rescue_max_roc).fillna(False).to_numpy(bool)
+                     & out.Acceleration.le(cfg.curvature_rescue_max_acceleration).fillna(False).to_numpy(bool))
     for lag in (1, 2, 3):
         if n <= lag:
             continue
@@ -92,7 +93,7 @@ def predict(grid, cfg=None, *, method="enhanced"):
     for h in HORIZONS:
         forecast = out[f"Forecast_Alert_{h}m"].fillna(0).eq(1).to_numpy(bool)
         combined = forecast | guard
-        if method == "guarded":
+        if method in ("guarded", "guarded_legacy"):
             # Borrow the safety architecture of predictive pump algorithms
             # without using dosing inputs: several causal CGM-only slope
             # scenarios vote on an impending low. A normal alert needs two

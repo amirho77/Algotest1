@@ -29,17 +29,24 @@ def predict_site(grid, slope_threshold=-0.1, horizon=10, cooldown=30):
     return out
 
 
-def evaluate_site(predictions, threshold=70, verify_minutes=30):
+def evaluate_alert_policy(predictions, alert_column, notification_column, threshold=70, verify_minutes=30):
+    """Score an alert policy using Farir Model 1's published event protocol.
+
+    All compared policies use strict ``< threshold`` low events, a first
+    alert within the preceding verification window for event capture, and
+    actual lows within the following window for notification correctness.
+    """
     raw = predictions.Raw.to_numpy(float)
     observed = (predictions.Observed & predictions.Bin_Complete).to_numpy(bool)
+    alerts = pd.to_numeric(predictions[alert_column], errors="coerce").fillna(0).to_numpy(float) != 0
     low = (predictions.Observed_Min.lt(threshold) & predictions.Label_Observed).to_numpy(bool)
     starts = np.flatnonzero(low & ~np.r_[False, low[:-1]])
     events=[]
     for i in starts:
         candidates=[k for k in range(max(0, i-verify_minutes//5), i)
-                    if predictions.Site_Alert.iloc[k] and observed[k:i+1].all() and raw[k] >= threshold]
+                    if alerts[k] and observed[k:i+1].all() and raw[k] >= threshold]
         events.append(bool(candidates))
-    notices = np.flatnonzero(predictions.Site_Notification.to_numpy(bool) & (raw >= threshold))
+    notices = np.flatnonzero((pd.to_numeric(predictions[notification_column], errors="coerce").fillna(0).to_numpy(float) != 0) & (raw >= threshold))
     outcomes=[]
     for k in notices:
         future=low[k+1:k+1+verify_minutes//5]
@@ -49,3 +56,7 @@ def evaluate_site(predictions, threshold=70, verify_minutes=30):
             "alerts": int(len(notices)), "correct_alerts": int(outcomes.count("correct")),
             "wrong_alerts": int(outcomes.count("wrong")),
             "precision": outcomes.count("correct")/len(outcomes) if outcomes else np.nan}
+
+
+def evaluate_site(predictions, threshold=70, verify_minutes=30):
+    return evaluate_alert_policy(predictions, "Site_Alert", "Site_Notification", threshold, verify_minutes)

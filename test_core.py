@@ -6,7 +6,7 @@ from core import prepare, predict, evaluate, evaluate_events, predict_latest, la
 from config import HORIZONS, InputConfig, ModelConfig
 from validation import assert_patient_disjoint, assert_purged_boundary
 from synthetic import make_scenario, SCENARIOS
-from site_compat import predict_site, evaluate_site
+from site_compat import predict_site, evaluate_site, evaluate_alert_policy
 
 
 def frame(values=None,n=60):
@@ -33,6 +33,13 @@ class InputTests(unittest.TestCase):
         g, _ = prepare(f, "time", "glucose")
         result = evaluate_site(predict_site(g))
         self.assertIn("event_recall", result)
+
+    def test_shared_farir_protocol_scores_equivalent_site_columns(self):
+        f = pd.DataFrame({"time": pd.date_range("2026-01-01", periods=48, freq="5min", tz="UTC"),
+                          "glucose": np.r_[np.full(40, 120.), np.linspace(100, 60, 8)]})
+        g, _ = prepare(f, "time", "glucose")
+        site = predict_site(g)
+        self.assertEqual(evaluate_site(site), evaluate_alert_policy(site, "Site_Alert", "Site_Notification"))
     def test_sisensing(self):
         f=pd.DataFrame({"time":["04-12-2024 10:45 GMT+3:30"],"glucose":[100]})
         g,m=prepare(f,"time","glucose")
@@ -206,6 +213,8 @@ class ScenarioTests(unittest.TestCase):
         self.assertTrue(guarded.Curvature_Drop_Risk.iloc[-1])
         self.assertTrue(guarded.Curvature_Crossing_20m.iloc[-1])
         self.assertIn("accelerating_drop",guarded.Alert_Reason.iloc[-1])
+        legacy=predict(grid,method="guarded_legacy")
+        self.assertFalse(legacy.Curvature_Drop_Risk.any())
 
     def test_preventive_recent_low_after_recovery(self):
         a,_,_=compute(frame(np.r_[np.full(56,150.),[65,68,72,75]]))
