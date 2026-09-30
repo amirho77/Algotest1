@@ -192,6 +192,13 @@ class ScenarioTests(unittest.TestCase):
         self.assertTrue(a.Fast_Drop_Risk.iloc[-3])
         self.assertTrue(a.Preventive_Alert.iloc[-3])
 
+    def test_guarded_policy_keeps_fast_drop_rescue_path(self):
+        grid,_=prepare(frame(np.r_[np.full(55,160.),[136,117,100,84,73,61]]),"time","glucose")
+        guarded=predict(grid,method="guarded")
+        self.assertIn("Scenario_Votes_30m",guarded.columns)
+        self.assertTrue(guarded.Fast_Drop_Risk.iloc[-3])
+        self.assertEqual(guarded.Alert_30m.iloc[-3],1)
+
     def test_preventive_recent_low_after_recovery(self):
         a,_,_=compute(frame(np.r_[np.full(56,150.),[65,68,72,75]]))
         self.assertTrue(a.Recent_Low_Risk.iloc[-1])
@@ -316,6 +323,12 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(len(ev),2)
         self.assertEqual(ev.Low_readings.tolist(),[4,1])
         self.assertEqual(s.All_events.tolist(),[2]*len(HORIZONS))
+
+    def test_event_needs_sustained_recovery_to_close(self):
+        f=frame(); f.loc[20:25,'glucose']=[60,69,74,68,62,75]
+        a,_,_=compute(f);ev,_=evaluate_events(a)
+        self.assertEqual(len(ev),1)
+        self.assertEqual(ev.Low_readings.iloc[0],4)
 
     def test_no_events_undefined_recall(self):
         a,s,_=compute(frame());ev,e=evaluate_events(a)

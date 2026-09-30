@@ -7,9 +7,9 @@ from model_v2 import predict as predict_v2, latest_state as state_v2
 
 def predict(grid, cfg=None, *, method="enhanced"):
     cfg = cfg or ModelConfig()
-    if method not in ("enhanced", "filtered", "episode", "recovery", "high_precision", "precision", "robust", "baseline"):
-        raise ValueError("Choose enhanced, filtered, episode, recovery, high_precision, precision, robust (v2), or baseline (v1).")
-    out = predict_v2(grid, cfg, method="robust" if method in ("enhanced", "filtered", "episode", "recovery", "high_precision", "precision") else method)
+    if method not in ("enhanced", "guarded", "filtered", "episode", "recovery", "high_precision", "precision", "robust", "baseline"):
+        raise ValueError("Choose enhanced, guarded, filtered, episode, recovery, high_precision, precision, robust (v2), or baseline (v1).")
+    out = predict_v2(grid, cfg, method="robust" if method in ("enhanced", "guarded", "filtered", "episode", "recovery", "high_precision", "precision") else method)
     for h in HORIZONS:
         out[f"Forecast_Alert_{h}m"] = out[f"Alert_{h}m"].copy()
     out["Alert_Ready"] = out.Prediction_Ready.copy()
@@ -17,9 +17,11 @@ def predict(grid, cfg=None, *, method="enhanced"):
     out["Near_Low_Risk"] = False
     out["Recent_Low_Risk"] = False
     out["Fast_Drop_Risk"] = False
+    out["Approaching_Low_Risk"] = False
+    out["Recovery_Filter"] = False
     out["Fast_ROC_10m"] = np.nan
     out["Alert_Reason"] = ""
-    if method not in ("enhanced", "filtered", "episode", "recovery", "high_precision", "precision"):
+    if method not in ("enhanced", "guarded", "filtered", "episode", "recovery", "high_precision", "precision"):
         out.attrs["method"] = method
         return out
     n = len(out)
@@ -29,6 +31,7 @@ def predict(grid, cfg=None, *, method="enhanced"):
     near = np.zeros(n, dtype=bool)
     recent = np.zeros(n, dtype=bool)
     fast = np.zeros(n, dtype=bool)
+    approaching = np.zeros(n, dtype=bool)
     rates = np.full(n, np.nan)
     if n >= 3:
         window = np.lib.stride_tricks.sliding_window_view(raw, 3)
@@ -45,6 +48,9 @@ def predict(grid, cfg=None, *, method="enhanced"):
             fast[indices] = (above & (np.diff(y, axis=1) < 0).all(axis=1) & (rate <= -cfg.fast_drop_rate)
                              & (y[:, -1] <= cfg.threshold + cfg.fast_drop_max_distance)
                              & (ema + rate*30 <= cfg.threshold))
+            approaching[indices] = (above & (np.diff(y, axis=1) < 0).all(axis=1)
+                                    & (rate <= -cfg.guarded_approach_rate)
+                                    & (y[:, -1] <= cfg.threshold + cfg.guarded_approach_margin))
     for lag in (1, 2, 3):
         if n <= lag:
             continue
@@ -68,6 +74,7 @@ def predict(grid, cfg=None, *, method="enhanced"):
     out["Near_Low_Risk"] = near_confirmed
     out["Recent_Low_Risk"] = recent_confirmed
     out["Fast_Drop_Risk"] = fast
+    out["Approaching_Low_Risk"] = approaching
     out["Fast_ROC_10m"] = rates
     out["Alert_Reason"] = ["|".join(name for name, flags in (("near_low", near_confirmed), ("recent_low", recent_confirmed), ("fast_drop", fast)) if flags[i]) for i in range(n)]
     out["Notification_Event_Id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
@@ -75,6 +82,39 @@ def predict(grid, cfg=None, *, method="enhanced"):
     for h in HORIZONS:
         forecast = out[f"Forecast_Alert_{h}m"].fillna(0).eq(1).to_numpy(bool)
         combined = forecast | guard
+        if method == "guarded":
+            # Borrow the safety architecture of predictive pump algorithms
+            # without using dosing inputs: several causal CGM-only slope
+            # scenarios vote on an impending low. A normal alert needs two
+            # scenario votes and two consecutive decision points. A fast,
+            # monotonic approach to the boundary stays an immediate rescue
+            # path so that confirmation does not hide rapid lows.
+            scenario_slopes = np.column_stack([
+                out.ROC_15m.to_numpy(float),
+                out.Slope_15m_Robust.to_numpy(float),
+                out.Slope_30m_Robust.to_numpy(float),
+            ])
+            current = out.Current_Glucose.to_numpy(float)
+            crossings = (current[:, None] + scenario_slopes * h <= cfg.threshold) & (scenario_slopes < 0)
+            consensus = np.isfinite(scenario_slopes).all(axis=1) & (crossings.sum(axis=1) >= 2)
+            delta = np.diff(raw, prepend=np.nan)
+            two_up = np.zeros(n, dtype=bool)
+            if n >= 3:
+                two_up[2:] = np.lib.stride_tricks.sliding_window_view(delta[1:], 2).min(axis=1) > 0
+            recovery = two_up | out.Acceleration.ge(0.05).fillna(False).to_numpy(bool)
+            persistence = out.Downward_Persistence.ge(50).fillna(False).to_numpy(bool)
+            base = consensus & persistence & ~recovery
+            confirmed = np.zeros(n, dtype=bool)
+            k = int(cfg.guarded_confirmations)
+            if k == 1:
+                confirmed = base
+            elif n >= k:
+                confirmed[k - 1:] = np.lib.stride_tricks.sliding_window_view(base, k).all(axis=1)
+            combined = confirmed | fast | (approaching & ~recovery) | (near_confirmed & ~recovery) | (recent_confirmed & ~recovery)
+            combined &= short_ready
+            out[f"Scenario_Votes_{h}m"] = crossings.sum(axis=1)
+            out[f"Scenario_Consensus_{h}m"] = consensus
+            out["Recovery_Filter"] = recovery
         if method == "episode":
             # Three-factor episode gate: persistent descent, no recent
             # rebound, then 2-of-3-bin confirmation before opening an event.

@@ -48,30 +48,55 @@ def evaluate(predictions, cfg=None):
 
 
 def evaluate_events(analysis, cfg=None):
-    """Simple consecutive-low runs; include all-event capture to expose abstention cost."""
+    """Group a low episode until a sustained recovery, then score causal alerts."""
     cfg=cfg or ModelConfig()
     observed=analysis.Label_Observed.to_numpy(bool)
     low=(analysis.Observed_Min.le(cfg.threshold)&analysis.Label_Observed).to_numpy(bool)
-    starts=np.flatnonzero(low & ~np.r_[False,low[:-1]]) if len(low) else []
+    values=analysis.Observed_Min.to_numpy(float)
     events=[]
-    for event_id,i in enumerate(starts,1):
-        j=i
-        while j+1<len(low) and low[j+1]:
-            j+=1
-        item={"Event":event_id,"Start_UTC":analysis.index[i],"End_low_UTC":analysis.index[j],
-              "Min_glucose":float(analysis.Observed_Min.iloc[i:j+1].min()),"Low_readings":j-i+1,
-              "Onset_observed":bool(i>0 and observed[i-1] and not low[i-1])}
+    i=0
+    event_id=0
+    while i<len(low):
+        if not low[i]:
+            i+=1
+            continue
+        event_id+=1
+        start=i
+        last_low=i
+        recovery_bins=0
+        i+=1
+        while i<len(low):
+            # A missing bin ends an event. It must not join two low periods
+            # whose continuity cannot be observed.
+            if not observed[i]:
+                break
+            if low[i]:
+                last_low=i
+                recovery_bins=0
+            elif values[i] >= cfg.threshold + cfg.event_recovery_margin:
+                recovery_bins+=1
+                if recovery_bins>=cfg.event_recovery_confirmations:
+                    break
+            else:
+                # A shallow, transient crossing above the threshold does not
+                # close a hypo episode.
+                recovery_bins=0
+            i+=1
+        j=last_low
+        item={"Event":event_id,"Start_UTC":analysis.index[start],"End_low_UTC":analysis.index[j],
+              "Min_glucose":float(analysis.Observed_Min.iloc[start:j+1].min()),"Low_readings":int(low[start:j+1].sum()),
+              "Onset_observed":bool(start>0 and observed[start-1] and not low[start-1])}
         for h in HORIZONS:
-            candidates=[k for k in range(max(0,i-h//5),i)
+            candidates=[k for k in range(max(0,start-h//5),start)
                         if bool(analysis.Alert_Ready.iloc[k]) and pd.notna(analysis.Raw.iloc[k])
-                        and analysis.Raw.iloc[k]>cfg.threshold and observed[k:i+1].all()]
+                        and analysis.Raw.iloc[k]>cfg.threshold and observed[k:start+1].all()]
             hits=[k for k in candidates if pd.notna(analysis[f"Alert_{h}m"].iloc[k])
                   and analysis[f"Alert_{h}m"].iloc[k] == 1]
             notices=[k for k in candidates if bool(analysis[f"Notification_{h}m"].iloc[k])]
             item[f"Eligible_{h}"]=bool(candidates)
             item[f"Captured_{h}"]=bool(hits)
             item[f"Notified_{h}"]=bool(notices)
-            item[f"Lead_minutes_{h}"]=float((analysis.index[i]-analysis.index[min(hits)]).total_seconds()/60) if hits else np.nan
+            item[f"Lead_minutes_{h}"]=float((analysis.index[start]-analysis.index[min(hits)]).total_seconds()/60) if hits else np.nan
         events.append(item)
     table=pd.DataFrame(events)
     summary=[]

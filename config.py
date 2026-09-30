@@ -3,7 +3,7 @@ from dataclasses import dataclass, asdict
 import math
 
 HORIZONS = (10, 15, 20, 25, 30)
-VERSION = "3.4.0-user-threshold-and-horizon"
+VERSION = "3.5.0-guarded-alert-policy"
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,11 @@ class ModelConfig:
     fast_drop_rate: float = 1.2
     preventive_confirmations: int = 2
     strict_confirmations: int = 2
+    guarded_confirmations: int = 2
+    guarded_approach_margin: float = 12.0
+    guarded_approach_rate: float = 0.4
+    event_recovery_margin: float = 5.0
+    event_recovery_confirmations: int = 2
     primary_horizon: int = 20
     target_precision: float = 0.95
 
@@ -35,6 +40,13 @@ class ModelConfig:
             raise ValueError("strict_confirmations must be at least one.")
         if self.preventive_confirmations < 1:
             raise ValueError("preventive_confirmations must be at least one.")
+        if self.guarded_confirmations < 1:
+            raise ValueError("guarded_confirmations must be at least one.")
+        if self.event_recovery_confirmations < 1:
+            raise ValueError("event_recovery_confirmations must be at least one.")
+        for value in (self.guarded_approach_margin, self.guarded_approach_rate, self.event_recovery_margin):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("Guarded approach settings must be positive and finite.")
         if self.primary_horizon not in HORIZONS:
             raise ValueError(f"primary_horizon must be one of {HORIZONS}.")
         if not math.isfinite(self.target_precision) or not 0 < self.target_precision <= 1:
